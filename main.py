@@ -44,10 +44,11 @@ PAGE_IMAGE_LEFT_MARGIN_MM = 40.0
 # Keeps a small safety margin outside the detected document.
 PERSPECTIVE_OUTER_MARGIN_RATIO = 0.025
 
-# White space around the document inside the final image.
-DOCUMENT_SAFE_MARGIN_MM = 8.0  # increased from 4.0 for clearly visible edges
+# Margin added in the PDF/DOCX around the card image (not baked into the PNG).
+# This keeps the PNG pixel-perfect at real card dimensions.
+PDF_CARD_MARGIN_MM = 8.0
 
-# Border styling (shadow removed for clean scan appearance).
+# Border styling (no shadow — clean scan appearance for legal use).
 BORDER_THICKNESS_PX = 2
 BORDER_COLOR = (170, 170, 170)   # light grey, BGR
 
@@ -170,6 +171,35 @@ def four_point_transform(image, pts):
     return warped
 
 
+def replace_dark_background_with_white(image, dark_threshold=60):
+    """
+    Flood-fills dark background pixels (shot on a dark surface) with white.
+    Seeds from all four corners; only replaces pixels darker than dark_threshold.
+    This preserves dark content inside the card (text, photos, barcodes).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    # Build a binary mask: 1 where pixel is dark (potential background).
+    dark_mask = (gray < dark_threshold).astype(np.uint8)
+
+    # Flood-fill from each corner on the dark mask to find connected background.
+    background_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    corners = [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]
+
+    flood_input = dark_mask.copy()
+    for (fy, fx) in corners:
+        if dark_mask[fy, fx] == 1:
+            cv2.floodFill(flood_input, background_mask, (fx, fy), 2)
+
+    # Pixels marked 2 are confirmed background — replace with white.
+    bg_pixels = (flood_input == 2)
+    result = image.copy()
+    result[bg_pixels] = [255, 255, 255]
+
+    return result
+
+
 def try_perspective_correction(image):
     resized, scale = resize_for_detection(image, max_dim=1000)
 
@@ -249,63 +279,42 @@ def rotate_to_landscape(image):
     return image, "no_rotation"
 
 
-def add_border(canvas_img, document_img, x, y):
+def render_card_png(image, target_width_mm, target_height_mm):
     """
-    Pastes the document onto the canvas and adds a thin grey border.
-    No shadow — keeps the output clean and scan-like for legal use.
+    Produces a PNG sized exactly to the real card dimensions at DPI resolution.
+    The card image fills the entire PNG — no margin is baked in here.
+    Margins are handled later by the PDF/DOCX layout functions.
+    A thin grey border is drawn to clearly define the card edges.
     """
-
-    doc_h, doc_w = document_img.shape[:2]
-
-    # Paste document onto white canvas.
-    canvas_img[y:y + doc_h, x:x + doc_w] = document_img
-
-    # Add thin grey border so all edges are clearly defined.
-    cv2.rectangle(
-        canvas_img,
-        (x, y),
-        (x + doc_w - 1, y + doc_h - 1),
-        BORDER_COLOR,
-        thickness=BORDER_THICKNESS_PX,
-    )
-
-    return canvas_img
-
-
-def fit_on_white_canvas(image, target_width_mm, target_height_mm):
-    """
-    Creates a final image with:
-    - pure white background,
-    - generous safe margin on all sides,
-    - thin grey border for edge definition.
-    """
-
     image, rotation_status = rotate_to_landscape(image)
 
-    canvas_w = mm_to_px(target_width_mm)
-    canvas_h = mm_to_px(target_height_mm)
+    target_w_px = mm_to_px(target_width_mm)
+    target_h_px = mm_to_px(target_height_mm)
 
-    margin_px = mm_to_px(DOCUMENT_SAFE_MARGIN_MM)
-
-    inner_w = max(canvas_w - 2 * margin_px, 1)
-    inner_h = max(canvas_h - 2 * margin_px, 1)
-
+    # Scale to fill the target dimensions while preserving aspect ratio.
     h, w = image.shape[:2]
-
-    scale = min(inner_w / w, inner_h / h)
-
+    scale = min(target_w_px / w, target_h_px / h)
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
 
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # Pure white canvas.
-    canvas_img = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+    # White canvas at exact card pixel dimensions.
+    canvas_img = np.full((target_h_px, target_w_px, 3), 255, dtype=np.uint8)
 
-    x = (canvas_w - new_w) // 2
-    y = (canvas_h - new_h) // 2
+    # Centre the card on the canvas (handles minor aspect ratio differences).
+    x = (target_w_px - new_w) // 2
+    y = (target_h_px - new_h) // 2
+    canvas_img[y:y + new_h, x:x + new_w] = resized
 
-    canvas_img = add_border(canvas_img, resized, x, y)
+    # Thin grey border to define all four edges clearly.
+    cv2.rectangle(
+        canvas_img,
+        (x, y),
+        (x + new_w - 1, y + new_h - 1),
+        BORDER_COLOR,
+        thickness=BORDER_THICKNESS_PX,
+    )
 
     return canvas_img, rotation_status
 
@@ -313,12 +322,17 @@ def fit_on_white_canvas(image, target_width_mm, target_height_mm):
 def process_image(input_path: Path, output_path: Path, target_width_mm, target_height_mm):
     image = read_image(input_path)
 
+    # Step 1: perspective-correct or trim to isolate the document.
     corrected, method = try_perspective_correction(image)
 
     if corrected is None:
         corrected, method = try_trim_border(image)
 
-    final_img, rotation_status = fit_on_white_canvas(
+    # Step 2: replace any remaining dark background with white.
+    corrected = replace_dark_background_with_white(corrected)
+
+    # Step 3: render at exact real-world card dimensions (no margin baked in).
+    final_img, rotation_status = render_card_png(
         corrected,
         target_width_mm,
         target_height_mm,
@@ -339,7 +353,6 @@ def add_left_positioned_image_to_docx(doc, image_path: Path, width_mm: float, he
     Inserts the image so that its left edge is PAGE_IMAGE_LEFT_MARGIN_MM
     from the physical left edge of the A4 page.
     """
-
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
@@ -397,17 +410,25 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
 
 
 def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Optional[Path]):
+    """
+    Places card images at their real physical size on the A4 page.
+    PDF_CARD_MARGIN_MM of white space is added around each card here,
+    keeping the PNG itself pixel-perfect at card dimensions.
+    """
     page_w, page_h = A4
     c = canvas.Canvas(str(pdf_path), pagesize=A4)
 
+    margin = PDF_CARD_MARGIN_MM * mm
     x = PAGE_IMAGE_LEFT_MARGIN_MM * mm
 
     if doc_type == "id":
         img_w = ID_CARD_WIDTH_MM * mm
         img_h = ID_CARD_HEIGHT_MM * mm
 
-        y_front = page_h - 55 * mm - img_h
-        y_back = y_front - 25 * mm - img_h
+        # Front card: top margin from page top + PDF_CARD_MARGIN_MM breathing room.
+        y_front = page_h - DOCX_PAGE_TOP_MARGIN_MM * mm - margin - img_h
+        # Back card: below front with margin gap between them.
+        y_back = y_front - margin - img_h
 
         c.drawImage(ImageReader(str(front_image)), x, y_front, width=img_w, height=img_h)
         c.drawImage(ImageReader(str(back_image)), x, y_back, width=img_w, height=img_h)
@@ -416,7 +437,7 @@ def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Opt
         img_w = PASSPORT_WIDTH_MM * mm
         img_h = PASSPORT_HEIGHT_MM * mm
 
-        y = page_h - 60 * mm - img_h
+        y = page_h - DOCX_PAGE_TOP_MARGIN_MM * mm - margin - img_h
 
         c.drawImage(ImageReader(str(front_image)), x, y, width=img_w, height=img_h)
 
