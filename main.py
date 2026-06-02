@@ -30,41 +30,26 @@ ID_CARD_ASPECT    = ID_CARD_WIDTH_MM / ID_CARD_HEIGHT_MM   # ≈ 1.5857
 
 PASSPORT_WIDTH_MM  = 125.0
 PASSPORT_HEIGHT_MM = 88.0
-PASSPORT_ASPECT    = PASSPORT_WIDTH_MM / PASSPORT_HEIGHT_MM  # ≈ 1.4205
+PASSPORT_ASPECT    = PASSPORT_WIDTH_MM / PASSPORT_HEIGHT_MM
 
 DPI = 300
 
-# A4 page/layout settings.
 DOCX_PAGE_LEFT_MARGIN_MM   = 20.0
 DOCX_PAGE_RIGHT_MARGIN_MM  = 20.0
 DOCX_PAGE_TOP_MARGIN_MM    = 20.0
 DOCX_PAGE_BOTTOM_MARGIN_MM = 20.0
 
-# Desired image start position from the physical left edge of the A4 page.
 PAGE_IMAGE_LEFT_MARGIN_MM = 40.0
-
-# White space added in PDF/DOCX around each card (not baked into the PNG).
-PDF_CARD_MARGIN_MM = 8.0
-
-# Border styling.
-BORDER_THICKNESS_PX = 2
-BORDER_COLOR = (170, 170, 170)   # light grey, BGR
+PDF_CARD_MARGIN_MM        = 8.0
 
 # Aspect ratio tolerance for card contour matching.
-ASPECT_TOLERANCE = 0.30
-
-# Minimum fraction of image area the card contour must occupy.
+ASPECT_TOLERANCE    = 0.30
 MIN_CARD_AREA_RATIO = 0.10
-
-# Background replacement: pixels darker than this are treated as background.
-# Raised to 90 to catch mid-grey shadows from phone photography.
-DARK_BG_THRESHOLD = 90
 
 
 @app.get("/")
 def home():
     return {"status": "ok", "message": "ID Clean Document API is running"}
-
 
 @app.get("/health")
 def health():
@@ -77,10 +62,8 @@ def safe_file_part(value: str) -> str:
     value = value.strip("_")
     return value or "clean_document"
 
-
 def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
     return int(round(mm_value / 25.4 * dpi))
-
 
 def read_image(path: Path):
     data  = np.fromfile(str(path), dtype=np.uint8)
@@ -89,12 +72,10 @@ def read_image(path: Path):
         raise ValueError(f"Could not read image: {path.name}")
     return image
 
-
 def save_png(path: Path, image_bgr):
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_img   = Image.fromarray(image_rgb)
     pil_img.save(path, dpi=(DPI, DPI))
-
 
 def resize_for_detection(image, max_dim=1500):
     h, w    = image.shape[:2]
@@ -105,9 +86,7 @@ def resize_for_detection(image, max_dim=1500):
     resized = cv2.resize(image, (int(w * scale), int(h * scale)))
     return resized, scale
 
-
 def order_points(pts):
-    """Return points in order: top-left, top-right, bottom-right, bottom-left."""
     rect    = np.zeros((4, 2), dtype="float32")
     s       = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -116,7 +95,6 @@ def order_points(pts):
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
-
 
 def four_point_transform(image, pts):
     rect = order_points(pts)
@@ -141,120 +119,81 @@ def four_point_transform(image, pts):
     ], dtype="float32")
 
     matrix = cv2.getPerspectiveTransform(rect, dst)
-    warped  = cv2.warpPerspective(
+    return cv2.warpPerspective(
         image, matrix, (max_width, max_height),
         borderValue=(255, 255, 255),
     )
-    return warped
 
 
-def replace_background_with_white(image, threshold=DARK_BG_THRESHOLD):
+def grabcut_remove_background(image):
     """
-    Flood-fills background pixels from all four corners with white.
-    Seeds from corners; only replaces pixels darker than threshold.
-    Preserves card content (text, photo, barcodes).
+    Uses GrabCut to separate the card (foreground) from the background.
+    The card is assumed to occupy roughly the centre 60% of the image.
+    Everything outside the detected foreground mask is set to white.
     """
-    gray        = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w        = gray.shape
-    dark_mask   = (gray < threshold).astype(np.uint8)
-    flood_input = dark_mask.copy()
-    fill_mask   = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    h, w = image.shape[:2]
 
-    for (fy, fx) in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
-        if dark_mask[fy, fx] == 1:
-            cv2.floodFill(flood_input, fill_mask, (fx, fy), 2)
+    # Define a rectangle that covers the central 60% — card is always here.
+    margin_x = int(w * 0.05)
+    margin_y = int(h * 0.05)
+    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+
+    mask     = np.zeros((h, w), dtype=np.uint8)
+    bgd_model = np.zeros((1, 65), dtype=np.float64)
+    fgd_model = np.zeros((1, 65), dtype=np.float64)
+
+    cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+
+    # Pixels marked as definite or probable foreground → keep.
+    fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+    # Clean up the mask: close small holes, remove small noise blobs.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
     result = image.copy()
-    result[flood_input == 2] = [255, 255, 255]
+    result[fg_mask == 0] = [255, 255, 255]
     return result
-
-
-def tight_crop_to_content(image):
-    """
-    Crop tightly to all non-white pixels, leaving 2 px padding.
-    Eliminates any residual white space that would shrink the rendered card.
-    """
-    gray   = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mask   = gray < 252
-    coords = np.argwhere(mask)
-
-    if coords.size == 0:
-        return image
-
-    y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0)
-
-    pad = 2
-    h, w = image.shape[:2]
-    y0 = max(y0 - pad, 0)
-    x0 = max(x0 - pad, 0)
-    y1 = min(y1 + pad, h - 1)
-    x1 = min(x1 + pad, w - 1)
-
-    cropped = image[y0:y1 + 1, x0:x1 + 1]
-    if cropped.shape[0] < 50 or cropped.shape[1] < 50:
-        return image
-    return cropped
 
 
 def build_card_mask(gray):
     """
-    Produces a binary mask that merges the card body and any printed content
-    (like MRZ text below the card edge) into one solid filled rectangle.
-    Strategy:
-      1. Threshold to find all non-background content.
-      2. Apply large morphological closing to bridge gaps between card body
-         and nearby printed elements (e.g. MRZ rows).
-      3. Return the filled mask.
+    Morphological mask that merges the card body and MRZ text into one
+    solid rectangle for contour detection.
     """
-    # Threshold: anything not close to white is card content.
     _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
 
-    # Large closing kernel bridges the gap between card body and MRZ text.
     close_size = max(gray.shape) // 20
     if close_size % 2 == 0:
         close_size += 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (close_size, close_size)
-    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
 
-    # Fill any internal holes so the card is a solid blob.
+    # Fill internal holes.
     flood = closed.copy()
-    h, w  = flood.shape
-    fmask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    fmask = np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), dtype=np.uint8)
     cv2.floodFill(flood, fmask, (0, 0), 255)
     filled = cv2.bitwise_not(flood)
-    solid  = cv2.bitwise_or(closed, filled)
-
-    return solid
+    return cv2.bitwise_or(closed, filled)
 
 
 def contour_to_quad(contour):
-    """
-    Reduce any contour to its best 4-point approximation using convex hull
-    + min-area rectangle, giving clean corners even on noisy edges.
-    """
-    hull = cv2.convexHull(contour)
-
-    # Try polygon approximation first.
+    """Reduce contour to best 4-point quad via convex hull."""
+    hull      = cv2.convexHull(contour)
     perimeter = cv2.arcLength(hull, True)
-    for eps_factor in [0.02, 0.03, 0.05, 0.08]:
-        approx = cv2.approxPolyDP(hull, eps_factor * perimeter, True)
+    for eps in [0.02, 0.03, 0.05, 0.08]:
+        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
         if len(approx) == 4:
             return approx.reshape(4, 2).astype("float32")
-
-    # Fallback: use the 4 corners of the minimum-area bounding rectangle.
     rect = cv2.minAreaRect(hull)
-    box  = cv2.boxPoints(rect)
-    return box.astype("float32")
+    return cv2.boxPoints(rect).astype("float32")
 
 
 def find_card_contour(image, target_aspect):
     """
-    Detects the card boundary using a morphologically-merged mask so that
-    the card body and any adjacent printed content (MRZ) form one solid blob.
-    Returns 4-point float32 array in original-image coordinates, or None.
+    Detect the card boundary using morphological mask.
+    Returns 4-point float32 in original-image coords, or None.
     """
     resized, scale = resize_for_detection(image, max_dim=1500)
     img_area       = resized.shape[0] * resized.shape[1]
@@ -263,10 +202,7 @@ def find_card_contour(image, target_aspect):
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
     solid_mask = build_card_mask(gray)
-
-    contours, _ = cv2.findContours(
-        solid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(solid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     best_pts  = None
     best_area = 0
@@ -287,28 +223,44 @@ def find_card_contour(image, target_aspect):
             continue
 
         aspect = card_w / card_h
-
-        # Accept landscape or portrait orientation.
-        match_landscape = abs(aspect - target_aspect)         <= ASPECT_TOLERANCE
-        match_portrait  = abs((1.0 / aspect) - target_aspect) <= ASPECT_TOLERANCE
-
-        if not match_landscape and not match_portrait:
+        if abs(aspect - target_aspect)         > ASPECT_TOLERANCE and \
+           abs((1.0 / aspect) - target_aspect) > ASPECT_TOLERANCE:
             continue
 
         if area > best_area:
             best_area = area
-            best_pts  = pts / scale   # back to original-image coordinates
+            best_pts  = pts / scale
 
     return best_pts
+
+
+def tight_crop_to_content(image):
+    """Crop tightly to all non-white pixels with 2 px padding."""
+    gray   = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask   = gray < 252
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return image
+
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0)
+    pad = 2
+    h, w = image.shape[:2]
+    y0 = max(y0 - pad, 0);  x0 = max(x0 - pad, 0)
+    y1 = min(y1 + pad, h - 1);  x1 = min(x1 + pad, w - 1)
+
+    cropped = image[y0:y1 + 1, x0:x1 + 1]
+    if cropped.shape[0] < 50 or cropped.shape[1] < 50:
+        return image
+    return cropped
 
 
 def extract_card(image, target_aspect):
     """
     Full extraction pipeline:
-      1. Morphology-based contour detection matched to card aspect ratio.
-      2. Perspective correction (or fallback).
-      3. Replace remaining background/shadow with white.
-      4. Tight-crop to card content.
+      1. Find card contour and perspective-correct.
+      2. GrabCut to remove any remaining background/shadow → white.
+      3. Tight-crop to card content only.
     """
     pts = find_card_contour(image, target_aspect)
 
@@ -319,9 +271,9 @@ def extract_card(image, target_aspect):
         corrected = image.copy()
         method    = "fallback_crop"
 
-    # Remove background and shadows AFTER perspective correction so the
-    # flood-fill seeds from the now-white warped corners.
-    corrected = replace_background_with_white(corrected)
+    # GrabCut works on the perspective-corrected image where the card
+    # fills most of the frame — much more reliable than on the raw photo.
+    corrected = grabcut_remove_background(corrected)
     corrected = tight_crop_to_content(corrected)
 
     return corrected, method
@@ -336,9 +288,8 @@ def rotate_to_landscape(image):
 
 def render_card_png(image, target_width_mm, target_height_mm):
     """
-    Produces a PNG at exact real-world card dimensions (DPI resolution).
-    The card fills the canvas as large as possible.
-    A thin grey border marks the edges. No margin baked in.
+    Renders the card at exact real-world dimensions (DPI resolution).
+    Pure white background. No border drawn — the card edges speak for themselves.
     """
     image, rotation_status = rotate_to_landscape(image)
 
@@ -357,15 +308,6 @@ def render_card_png(image, target_width_mm, target_height_mm):
     x = (target_w_px - new_w) // 2
     y = (target_h_px - new_h) // 2
     canvas_img[y:y + new_h, x:x + new_w] = resized
-
-    # Thin grey border so all four edges are clearly defined.
-    cv2.rectangle(
-        canvas_img,
-        (x, y),
-        (x + new_w - 1, y + new_h - 1),
-        BORDER_COLOR,
-        thickness=BORDER_THICKNESS_PX,
-    )
 
     return canvas_img, rotation_status
 
@@ -426,10 +368,6 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 
 def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Optional[Path]):
-    """
-    Places card images at their real physical size on the A4 page.
-    PDF_CARD_MARGIN_MM of white space surrounds each card.
-    """
     page_w, page_h = A4
     c      = canvas.Canvas(str(pdf_path), pagesize=A4)
     margin = PDF_CARD_MARGIN_MM * mm
@@ -442,13 +380,11 @@ def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Opt
         y_back  = y_front - margin - img_h
         c.drawImage(ImageReader(str(front_image)), x, y_front, width=img_w, height=img_h)
         c.drawImage(ImageReader(str(back_image)),  x, y_back,  width=img_w, height=img_h)
-
     elif doc_type == "passport":
         img_w = PASSPORT_WIDTH_MM  * mm
         img_h = PASSPORT_HEIGHT_MM * mm
         y     = page_h - DOCX_PAGE_TOP_MARGIN_MM * mm - margin - img_h
         c.drawImage(ImageReader(str(front_image)), x, y, width=img_w, height=img_h)
-
     else:
         raise ValueError(f"Unsupported document type: {doc_type}")
 
@@ -461,7 +397,6 @@ def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Opt
 async def save_upload(upload_file: UploadFile, destination: Path):
     content = await upload_file.read()
     destination.write_bytes(content)
-
 
 def file_to_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
@@ -483,10 +418,8 @@ async def process_document(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     doc_type = str(doc_type or "").lower().strip()
-
     if doc_type not in ["id", "passport"]:
         raise HTTPException(status_code=400, detail="doc_type must be 'id' or 'passport'")
-
     if doc_type == "id" and back_image is None:
         raise HTTPException(status_code=400, detail="Back image is required for ID documents")
 
@@ -547,7 +480,6 @@ async def process_document_test(
 ):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
     if doc_type == "id" and back_image is None:
         raise HTTPException(status_code=400, detail="Back image is required for ID documents")
 
