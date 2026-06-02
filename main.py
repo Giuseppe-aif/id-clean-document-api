@@ -32,6 +32,7 @@ PASSPORT_HEIGHT_MM = 88.0
 
 DPI = 300
 
+DOCUMENT_SAFE_MARGIN_MM = 4.0
 
 @app.get("/")
 def home():
@@ -212,13 +213,25 @@ def rotate_to_landscape(image):
 
 
 def fit_on_white_canvas(image, target_width_mm, target_height_mm):
+    """
+    Creates a final image with the exact target physical size,
+    but leaves a safe white margin around the document so that
+    the full document remains clearly visible.
+    """
+
     image, rotation_status = rotate_to_landscape(image)
 
     canvas_w = mm_to_px(target_width_mm)
     canvas_h = mm_to_px(target_height_mm)
 
+    margin_px = mm_to_px(DOCUMENT_SAFE_MARGIN_MM)
+
+    inner_w = max(canvas_w - 2 * margin_px, 1)
+    inner_h = max(canvas_h - 2 * margin_px, 1)
+
     h, w = image.shape[:2]
-    scale = min(canvas_w / w, canvas_h / h)
+
+    scale = min(inner_w / w, inner_h / h)
 
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
