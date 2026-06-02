@@ -32,12 +32,19 @@ PASSPORT_HEIGHT_MM = 88.0
 
 DPI = 300
 
-# Margin added around the detected document before perspective correction.
-# This helps keep the document sides and corners visible.
-PERSPECTIVE_OUTER_MARGIN_RATIO = 0.06
+# Keeps a very small safety margin outside the detected document.
+# The visible page margin and shadow are handled later.
+PERSPECTIVE_OUTER_MARGIN_RATIO = 0.025
 
-# White margin inside the final real-size image canvas.
-DOCUMENT_SAFE_MARGIN_MM = 3.0
+# White space around the document inside the final image.
+DOCUMENT_SAFE_MARGIN_MM = 4.0
+
+# Shadow / border styling.
+SHADOW_OFFSET_MM = 1.2
+SHADOW_BLUR_MM = 1.2
+BORDER_THICKNESS_PX = 2
+BORDER_COLOR = (170, 170, 170)   # light grey, BGR
+SHADOW_COLOR = (205, 205, 205)   # very light grey, BGR
 
 
 @app.get("/")
@@ -109,12 +116,6 @@ def order_points(pts):
 
 
 def expand_points_from_center(pts, ratio, image_shape):
-    """
-    Expands the detected document corner points outward from their center.
-    This keeps a visible margin around the document instead of cropping
-    exactly on the document edge.
-    """
-
     h, w = image_shape[:2]
 
     center = np.mean(pts, axis=0)
@@ -206,11 +207,6 @@ def try_perspective_correction(image):
 
 
 def try_trim_border(image):
-    """
-    Fallback crop for images where perspective detection fails.
-    It keeps a larger margin than before so the document is not cropped too tightly.
-    """
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     mask = gray < 245
@@ -224,8 +220,7 @@ def try_trim_border(image):
 
     h, w = image.shape[:2]
 
-    # Larger fallback margin than before.
-    margin = int(min(h, w) * 0.06)
+    margin = int(min(h, w) * 0.04)
 
     y0 = max(y0 - margin, 0)
     x0 = max(x0 - margin, 0)
@@ -249,10 +244,62 @@ def rotate_to_landscape(image):
     return image, "no_rotation"
 
 
+def add_shadow_and_border(canvas_img, document_img, x, y):
+    """
+    Adds a subtle shadow and border around the placed document image.
+    This makes the document sides and corners distinguishable on a white page.
+    """
+
+    doc_h, doc_w = document_img.shape[:2]
+
+    shadow_offset = mm_to_px(SHADOW_OFFSET_MM)
+    blur_px = mm_to_px(SHADOW_BLUR_MM)
+
+    if blur_px % 2 == 0:
+        blur_px += 1
+
+    h, w = canvas_img.shape[:2]
+
+    shadow_layer = np.full_like(canvas_img, 255)
+    shadow_mask = np.zeros((h, w), dtype=np.uint8)
+
+    sx1 = min(max(x + shadow_offset, 0), w - 1)
+    sy1 = min(max(y + shadow_offset, 0), h - 1)
+    sx2 = min(max(x + shadow_offset + doc_w, 0), w - 1)
+    sy2 = min(max(y + shadow_offset + doc_h, 0), h - 1)
+
+    cv2.rectangle(shadow_mask, (sx1, sy1), (sx2, sy2), 180, thickness=-1)
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (blur_px, blur_px), 0)
+
+    shadow_colored = np.full_like(canvas_img, SHADOW_COLOR)
+
+    alpha = (shadow_mask.astype(np.float32) / 255.0) * 0.45
+    alpha = alpha[:, :, None]
+
+    canvas_img = (canvas_img * (1 - alpha) + shadow_colored * alpha).astype(np.uint8)
+
+    # Paste document on top.
+    canvas_img[y:y + doc_h, x:x + doc_w] = document_img
+
+    # Add subtle border.
+    cv2.rectangle(
+        canvas_img,
+        (x, y),
+        (x + doc_w - 1, y + doc_h - 1),
+        BORDER_COLOR,
+        thickness=BORDER_THICKNESS_PX,
+    )
+
+    return canvas_img
+
+
 def fit_on_white_canvas(image, target_width_mm, target_height_mm):
     """
-    Creates a final image with the exact target physical size,
-    while leaving a safe white margin inside the image canvas.
+    Creates a final image with:
+    - pure white background,
+    - safe margin,
+    - subtle grey shadow,
+    - subtle grey border.
     """
 
     image, rotation_status = rotate_to_landscape(image)
@@ -261,9 +308,10 @@ def fit_on_white_canvas(image, target_width_mm, target_height_mm):
     canvas_h = mm_to_px(target_height_mm)
 
     margin_px = mm_to_px(DOCUMENT_SAFE_MARGIN_MM)
+    shadow_allowance_px = mm_to_px(SHADOW_OFFSET_MM + SHADOW_BLUR_MM)
 
-    inner_w = max(canvas_w - 2 * margin_px, 1)
-    inner_h = max(canvas_h - 2 * margin_px, 1)
+    inner_w = max(canvas_w - 2 * margin_px - shadow_allowance_px, 1)
+    inner_h = max(canvas_h - 2 * margin_px - shadow_allowance_px, 1)
 
     h, w = image.shape[:2]
 
@@ -279,7 +327,7 @@ def fit_on_white_canvas(image, target_width_mm, target_height_mm):
     x = (canvas_w - new_w) // 2
     y = (canvas_h - new_h) // 2
 
-    canvas_img[y:y + new_h, x:x + new_w] = resized
+    canvas_img = add_shadow_and_border(canvas_img, resized, x, y)
 
     return canvas_img, rotation_status
 
