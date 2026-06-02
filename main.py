@@ -32,20 +32,26 @@ PASSPORT_HEIGHT_MM = 88.0
 
 DPI = 300
 
-DOCUMENT_SAFE_MARGIN_MM = 4.0
+# Margin added around the detected document before perspective correction.
+# This helps keep the document sides and corners visible.
+PERSPECTIVE_OUTER_MARGIN_RATIO = 0.06
+
+# White margin inside the final real-size image canvas.
+DOCUMENT_SAFE_MARGIN_MM = 3.0
+
 
 @app.get("/")
 def home():
     return {
         "status": "ok",
-        "message": "ID Clean Document API is running"
+        "message": "ID Clean Document API is running",
     }
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "healthy"
+        "status": "healthy",
     }
 
 
@@ -92,14 +98,32 @@ def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
 
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    rect[0] = pts[np.argmin(s)]      # top-left
+    rect[2] = pts[np.argmax(s)]      # bottom-right
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    rect[1] = pts[np.argmin(diff)]   # top-right
+    rect[3] = pts[np.argmax(diff)]   # bottom-left
 
     return rect
+
+
+def expand_points_from_center(pts, ratio, image_shape):
+    """
+    Expands the detected document corner points outward from their center.
+    This keeps a visible margin around the document instead of cropping
+    exactly on the document edge.
+    """
+
+    h, w = image_shape[:2]
+
+    center = np.mean(pts, axis=0)
+    expanded = center + (pts - center) * (1.0 + ratio)
+
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, w - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, h - 1)
+
+    return expanded.astype("float32")
 
 
 def four_point_transform(image, pts):
@@ -170,12 +194,23 @@ def try_perspective_correction(image):
             pts = approx.reshape(4, 2).astype("float32")
             pts = pts / scale
 
-            return four_point_transform(image, pts), "perspective_corrected"
+            pts = expand_points_from_center(
+                pts,
+                PERSPECTIVE_OUTER_MARGIN_RATIO,
+                image.shape,
+            )
+
+            return four_point_transform(image, pts), "perspective_corrected_with_outer_margin"
 
     return None, "no_contour_found"
 
 
 def try_trim_border(image):
+    """
+    Fallback crop for images where perspective detection fails.
+    It keeps a larger margin than before so the document is not cropped too tightly.
+    """
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     mask = gray < 245
@@ -188,7 +223,9 @@ def try_trim_border(image):
     y1, x1 = coords.max(axis=0)
 
     h, w = image.shape[:2]
-    margin = int(min(h, w) * 0.02)
+
+    # Larger fallback margin than before.
+    margin = int(min(h, w) * 0.06)
 
     y0 = max(y0 - margin, 0)
     x0 = max(x0 - margin, 0)
@@ -200,7 +237,7 @@ def try_trim_border(image):
     if cropped.shape[0] < 100 or cropped.shape[1] < 100:
         return image, "trim_failed"
 
-    return cropped, "border_trimmed"
+    return cropped, "border_trimmed_with_outer_margin"
 
 
 def rotate_to_landscape(image):
@@ -215,8 +252,7 @@ def rotate_to_landscape(image):
 def fit_on_white_canvas(image, target_width_mm, target_height_mm):
     """
     Creates a final image with the exact target physical size,
-    but leaves a safe white margin around the document so that
-    the full document remains clearly visible.
+    while leaving a safe white margin inside the image canvas.
     """
 
     image, rotation_status = rotate_to_landscape(image)
@@ -272,6 +308,18 @@ def process_image(input_path: Path, output_path: Path, target_width_mm, target_h
     }
 
 
+def add_centered_image_to_docx(doc, image_path: Path, width_mm: float, height_mm: float):
+    paragraph = doc.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    run = paragraph.add_run()
+    run.add_picture(
+        str(image_path),
+        width=Cm(width_mm / 10.0),
+        height=Cm(height_mm / 10.0),
+    )
+
+
 def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: Optional[Path]):
     doc = Document()
 
@@ -312,18 +360,6 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
         raise ValueError(f"Unsupported document type: {doc_type}")
 
     doc.save(docx_path)
-
-
-def add_centered_image_to_docx(doc, image_path: Path, width_mm: float, height_mm: float):
-    paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    run = paragraph.add_run()
-    run.add_picture(
-        str(image_path),
-        width=Cm(width_mm / 10.0),
-        height=Cm(height_mm / 10.0),
-    )
 
 
 def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Optional[Path]):
