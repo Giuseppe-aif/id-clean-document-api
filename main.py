@@ -127,30 +127,52 @@ def four_point_transform(image, pts):
 
 def grabcut_remove_background(image):
     """
-    Uses GrabCut to separate the card (foreground) from the background.
-    The card is assumed to occupy roughly the centre 60% of the image.
-    Everything outside the detected foreground mask is set to white.
+    Uses GrabCut to separate the card (foreground) from the background,
+    then applies two extra passes to ensure clean white edges:
+      1. Force-white a border strip around the image edges (always background).
+      2. Fill the foreground mask to its convex hull so no interior holes remain.
+    Everything outside the foreground mask is set to white.
     """
     h, w = image.shape[:2]
 
-    # Define a rectangle that covers the central 60% — card is always here.
-    margin_x = int(w * 0.05)
-    margin_y = int(h * 0.05)
-    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+    # Border strip width — 4% of the shorter dimension.
+    # Pixels this close to the image edge are always background, never card.
+    border = max(int(min(h, w) * 0.04), 5)
 
-    mask     = np.zeros((h, w), dtype=np.uint8)
+    # GrabCut hint rect: exclude the border strip.
+    rect = (border, border, w - 2 * border, h - 2 * border)
+
+    mask      = np.zeros((h, w), dtype=np.uint8)
     bgd_model = np.zeros((1, 65), dtype=np.float64)
     fgd_model = np.zeros((1, 65), dtype=np.float64)
 
     cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
 
     # Pixels marked as definite or probable foreground → keep.
-    fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    fg_mask = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
 
-    # Clean up the mask: close small holes, remove small noise blobs.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Force the border strip to background (white) regardless of GrabCut output.
+    fg_mask[:border,  :]  = 0
+    fg_mask[-border:, :]  = 0
+    fg_mask[:,  :border]  = 0
+    fg_mask[:, -border:]  = 0
+
+    # Close small holes inside the card area.
+    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=4)
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+
+    # Fill mask to its convex hull — eliminates any remaining concave gaps
+    # at corners that morphological closing can miss.
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest  = max(contours, key=cv2.contourArea)
+        hull     = cv2.convexHull(largest)
+        hull_mask = np.zeros_like(fg_mask)
+        cv2.drawContours(hull_mask, [hull], -1, 255, thickness=cv2.FILLED)
+        fg_mask = cv2.bitwise_or(fg_mask, hull_mask)
 
     result = image.copy()
     result[fg_mask == 0] = [255, 255, 255]
