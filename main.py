@@ -32,8 +32,16 @@ PASSPORT_HEIGHT_MM = 88.0
 
 DPI = 300
 
-# Keeps a very small safety margin outside the detected document.
-# The visible page margin and shadow are handled later.
+# A4 page/layout settings.
+DOCX_PAGE_LEFT_MARGIN_MM = 20.0
+DOCX_PAGE_RIGHT_MARGIN_MM = 20.0
+DOCX_PAGE_TOP_MARGIN_MM = 20.0
+DOCX_PAGE_BOTTOM_MARGIN_MM = 20.0
+
+# Desired image start position from the physical left edge of the A4 page.
+PAGE_IMAGE_LEFT_MARGIN_MM = 40.0
+
+# Keeps a small safety margin outside the detected document.
 PERSPECTIVE_OUTER_MARGIN_RATIO = 0.025
 
 # White space around the document inside the final image.
@@ -260,7 +268,6 @@ def add_shadow_and_border(canvas_img, document_img, x, y):
 
     h, w = canvas_img.shape[:2]
 
-    shadow_layer = np.full_like(canvas_img, 255)
     shadow_mask = np.zeros((h, w), dtype=np.uint8)
 
     sx1 = min(max(x + shadow_offset, 0), w - 1)
@@ -356,9 +363,17 @@ def process_image(input_path: Path, output_path: Path, target_width_mm, target_h
     }
 
 
-def add_centered_image_to_docx(doc, image_path: Path, width_mm: float, height_mm: float):
+def add_left_positioned_image_to_docx(doc, image_path: Path, width_mm: float, height_mm: float):
+    """
+    Inserts the image so that its left edge is PAGE_IMAGE_LEFT_MARGIN_MM
+    from the physical left edge of the A4 page.
+    """
+
     paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    extra_indent_mm = max(PAGE_IMAGE_LEFT_MARGIN_MM - DOCX_PAGE_LEFT_MARGIN_MM, 0)
+    paragraph.paragraph_format.left_indent = Cm(extra_indent_mm / 10.0)
 
     run = paragraph.add_run()
     run.add_picture(
@@ -374,13 +389,13 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
     section = doc.sections[0]
     section.page_width = Cm(21.0)
     section.page_height = Cm(29.7)
-    section.top_margin = Cm(2.0)
-    section.bottom_margin = Cm(2.0)
-    section.left_margin = Cm(2.0)
-    section.right_margin = Cm(2.0)
+    section.top_margin = Cm(DOCX_PAGE_TOP_MARGIN_MM / 10.0)
+    section.bottom_margin = Cm(DOCX_PAGE_BOTTOM_MARGIN_MM / 10.0)
+    section.left_margin = Cm(DOCX_PAGE_LEFT_MARGIN_MM / 10.0)
+    section.right_margin = Cm(DOCX_PAGE_RIGHT_MARGIN_MM / 10.0)
 
     if doc_type == "id":
-        add_centered_image_to_docx(
+        add_left_positioned_image_to_docx(
             doc,
             front_image,
             ID_CARD_WIDTH_MM,
@@ -389,7 +404,7 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
 
         doc.add_paragraph("")
 
-        add_centered_image_to_docx(
+        add_left_positioned_image_to_docx(
             doc,
             back_image,
             ID_CARD_WIDTH_MM,
@@ -397,7 +412,7 @@ def create_docx(docx_path: Path, doc_type: str, front_image: Path, back_image: O
         )
 
     elif doc_type == "passport":
-        add_centered_image_to_docx(
+        add_left_positioned_image_to_docx(
             doc,
             front_image,
             PASSPORT_WIDTH_MM,
@@ -414,11 +429,12 @@ def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Opt
     page_w, page_h = A4
     c = canvas.Canvas(str(pdf_path), pagesize=A4)
 
+    x = PAGE_IMAGE_LEFT_MARGIN_MM * mm
+
     if doc_type == "id":
         img_w = ID_CARD_WIDTH_MM * mm
         img_h = ID_CARD_HEIGHT_MM * mm
 
-        x = (page_w - img_w) / 2
         y_front = page_h - 55 * mm - img_h
         y_back = y_front - 25 * mm - img_h
 
@@ -429,7 +445,6 @@ def create_pdf(pdf_path: Path, doc_type: str, front_image: Path, back_image: Opt
         img_w = PASSPORT_WIDTH_MM * mm
         img_h = PASSPORT_HEIGHT_MM * mm
 
-        x = (page_w - img_w) / 2
         y = page_h - 60 * mm - img_h
 
         c.drawImage(ImageReader(str(front_image)), x, y, width=img_w, height=img_h)
