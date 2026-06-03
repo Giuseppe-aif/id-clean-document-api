@@ -577,3 +577,9 @@ async def process_document_test(
         "front_filename":   front_image.filename,
         "back_filename":    back_image.filename if back_image else None,
     }
+
+VERSION = "2025-06-03-v1"
+
+@app.get("/version")
+def version():
+    return {"version": VERSION}
