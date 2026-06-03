@@ -31,9 +31,16 @@ ID_CARD_WIDTH_MM  = 85.60
 ID_CARD_HEIGHT_MM = 53.98
 ID_CARD_ASPECT    = ID_CARD_WIDTH_MM / ID_CARD_HEIGHT_MM   # ≈ 1.5857
 
-PASSPORT_WIDTH_MM  = 176.0   # two-page spread, landscape
-PASSPORT_HEIGHT_MM = 125.0
-PASSPORT_ASPECT    = PASSPORT_WIDTH_MM / PASSPORT_HEIGHT_MM
+# The raw scan is a landscape two-page spread (176 × 125 mm).
+# We rotate it 90° CCW so text reads left-to-right and the image
+# sits portrait (tall) on the A4 page: width=125 mm, height=176 mm.
+PASSPORT_SCAN_WIDTH_MM  = 176.0
+PASSPORT_SCAN_HEIGHT_MM = 125.0
+PASSPORT_SCAN_ASPECT    = PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
+
+# After rotation the canvas dimensions are swapped.
+PASSPORT_WIDTH_MM  = PASSPORT_SCAN_HEIGHT_MM   # 125
+PASSPORT_HEIGHT_MM = PASSPORT_SCAN_WIDTH_MM    # 176
 
 DPI = 300
 
@@ -299,8 +306,12 @@ def extract_card(image: np.ndarray, target_aspect: float):
 
 # ── Rendering at exact physical size ─────────────────────────────────────────
 
-def rotate_to_landscape_rgba(rgba: Image.Image):
-    """Rotate portrait RGBA to landscape if needed."""
+def rotate_ccw_90(rgba: Image.Image):
+    """Rotate 90 degrees counter-clockwise so landscape spread becomes portrait."""
+    return rgba.rotate(90, expand=True), "rotated_ccw_90"
+
+def rotate_id_to_landscape(rgba: Image.Image):
+    """For ID cards: ensure the card is landscape (wider than tall)."""
     if rgba.height > rgba.width:
         return rgba.rotate(-90, expand=True), "rotated_landscape"
     return rgba, "no_rotation"
@@ -309,12 +320,20 @@ def render_card_png(
     rgba: Image.Image,
     target_width_mm: float,
     target_height_mm: float,
+    doc_type: str = "id",
 ) -> tuple[np.ndarray, str]:
     """
     Render the RGBA card onto an exact physical-size white canvas at DPI
     resolution.  Returns a BGR ndarray ready to save.
+
+    ID cards : rotate to landscape (wider than tall) if needed.
+    Passport : rotate 90 CCW so the landscape two-page spread becomes
+               portrait with text reading left-to-right.
     """
-    rgba, rotation_status = rotate_to_landscape_rgba(rgba)
+    if doc_type == "passport":
+        rgba, rotation_status = rotate_ccw_90(rgba)
+    else:
+        rgba, rotation_status = rotate_id_to_landscape(rgba)
 
     target_w_px = mm_to_px(target_width_mm)
     target_h_px = mm_to_px(target_height_mm)
@@ -344,13 +363,22 @@ def process_image(
     output_path: Path,
     target_width_mm: float,
     target_height_mm: float,
+    doc_type: str = "id",
 ) -> dict:
-    image         = read_image(input_path)
-    target_aspect = target_width_mm / target_height_mm
+    image = read_image(input_path)
 
-    rgba, method = extract_card(image, target_aspect)
+    # For passport the raw scan is landscape (wider than tall), so use the
+    # scan aspect ratio for contour detection, not the post-rotation one.
+    if doc_type == "passport":
+        detection_aspect = PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
+    else:
+        detection_aspect = target_width_mm / target_height_mm
 
-    final_bgr, rotation_status = render_card_png(rgba, target_width_mm, target_height_mm)
+    rgba, method = extract_card(image, detection_aspect)
+
+    final_bgr, rotation_status = render_card_png(
+        rgba, target_width_mm, target_height_mm, doc_type=doc_type
+    )
 
     save_png(output_path, final_bgr)
 
@@ -485,16 +513,16 @@ async def process_document(
             front_processed = tmp / "front_processed.png"
             back_processed  = tmp / "back_processed.png"
             processed_info.append(
-                process_image(front_input, front_processed, ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM)
+                process_image(front_input, front_processed, ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM,  doc_type="id")
             )
             processed_info.append(
-                process_image(back_input,  back_processed,  ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM)
+                process_image(back_input,  back_processed,  ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM,  doc_type="id")
             )
         else:
             front_processed = tmp / "passport_processed.png"
             back_processed  = None
             processed_info.append(
-                process_image(front_input, front_processed, PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM)
+                process_image(front_input, front_processed, PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM, doc_type="passport")
             )
 
         docx_filename = f"{output_base_name}.docx"
