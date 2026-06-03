@@ -1,8 +1,8 @@
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
 opencv-python-headless
 numpy
 pillow
+rembg
 python-docx
 reportlab
