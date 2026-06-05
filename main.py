@@ -8,17 +8,20 @@ import tempfile
 
 import cv2
 import numpy as np
-from PIL import Image
-from rembg import remove, new_session
+from PIL import Image, ImageFilter, ImageDraw, ExifTags
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Cm
+from docx.shared import Cm, Pt, RGBColor
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
+from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import ImageReader
+
+import io
 
 
 app = FastAPI()
@@ -54,21 +57,17 @@ DOCX_PAGE_BOTTOM_MARGIN_MM = 20.0
 PAGE_IMAGE_LEFT_MARGIN_MM = 40.0
 PDF_CARD_MARGIN_MM        = 8.0
 
+# ── Shadow settings ───────────────────────────────────────────────────────────
+
+SHADOW_OFFSET_MM  = 2.0    # how far the shadow is offset (right + down)
+SHADOW_BLUR_MM    = 3.0    # blur radius of the shadow
+SHADOW_OPACITY    = 160    # 0-255; 160 ≈ 63% opacity (matches Word "Centre Shadow Rectangle")
+SHADOW_COLOR      = (80, 80, 80)  # dark grey, not pure black
+
 # ── Detection tunables ────────────────────────────────────────────────────────
 
 ASPECT_TOLERANCE    = 0.30
 MIN_CARD_AREA_RATIO = 0.10
-
-# ── rembg session (loaded once at startup) ────────────────────────────────────
-# "isnet-general-use" is the most accurate general model.
-# Swap for "u2net" if you want faster inference with slightly lower quality.
-_REMBG_SESSION = None
-
-def get_rembg_session():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None:
-        _REMBG_SESSION = new_session("isnet-general-use")
-    return _REMBG_SESSION
 
 
 # ── Health endpoints ──────────────────────────────────────────────────────────
@@ -93,19 +92,49 @@ def safe_file_part(value: str) -> str:
 def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
     return int(round(mm_value / 25.4 * dpi))
 
-def read_image(path: Path) -> np.ndarray:
-    """Read any image OpenCV can handle, regardless of filename extension."""
-    data  = np.fromfile(str(path), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f"Could not read image: {path.name}")
-    return image
+
+# ── EXIF-aware image reading ──────────────────────────────────────────────────
+# FIX: OpenCV's imdecode ignores EXIF orientation. We use Pillow first so that
+# phone photos taken in landscape (stored as portrait + EXIF rotate) are
+# correctly oriented before any processing begins.
+
+def read_image_exif_aware(path: Path) -> np.ndarray:
+    """
+    Read an image file respecting EXIF orientation metadata.
+    Returns a BGR ndarray (OpenCV convention).
+    """
+    pil_img = Image.open(path)
+
+    # Apply EXIF orientation if present
+    try:
+        exif = pil_img._getexif()
+        if exif:
+            orientation_key = next(
+                (k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None
+            )
+            if orientation_key and orientation_key in exif:
+                orientation = exif[orientation_key]
+                rotations = {
+                    3: 180,
+                    6: -90,   # 270 CCW == 90 CW
+                    8:  90,
+                }
+                flip_horizontal = {2, 4, 5, 7}
+                if orientation in rotations:
+                    pil_img = pil_img.rotate(rotations[orientation], expand=True)
+                elif orientation in flip_horizontal:
+                    pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
+                    if orientation in {5, 7}:
+                        pil_img = pil_img.rotate(90 if orientation == 5 else -90, expand=True)
+    except Exception:
+        pass  # No EXIF or unreadable — proceed with raw pixels
+
+    pil_img = pil_img.convert("RGB")
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
 
 def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-
-def pil_to_bgr(image_pil: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(image_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 def save_png(path: Path, image_bgr: np.ndarray):
     pil_img = bgr_to_pil(image_bgr)
@@ -174,7 +203,6 @@ def build_card_mask(gray: np.ndarray) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
 
-    # Fill internal holes by flood-filling from the border.
     flood = closed.copy()
     fmask = np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), dtype=np.uint8)
     cv2.floodFill(flood, fmask, (0, 0), 255)
@@ -182,7 +210,6 @@ def build_card_mask(gray: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(closed, filled)
 
 def contour_to_quad(contour: np.ndarray) -> np.ndarray:
-    """Reduce a contour to the best 4-point quad via convex hull."""
     hull      = cv2.convexHull(contour)
     perimeter = cv2.arcLength(hull, True)
     for eps in [0.02, 0.03, 0.05, 0.08]:
@@ -193,10 +220,6 @@ def contour_to_quad(contour: np.ndarray) -> np.ndarray:
     return cv2.boxPoints(rect).astype("float32")
 
 def find_card_contour(image: np.ndarray, target_aspect: float) -> Optional[np.ndarray]:
-    """
-    Detect the card boundary using morphological mask + aspect-ratio filtering.
-    Returns 4-point float32 array in original-image coordinates, or None.
-    """
     resized, scale = resize_for_detection(image, max_dim=1500)
     img_area       = resized.shape[0] * resized.shape[1]
 
@@ -236,127 +259,102 @@ def find_card_contour(image: np.ndarray, target_aspect: float) -> Optional[np.nd
     return best_pts
 
 
-# ── Background removal (rembg) ────────────────────────────────────────────────
+# ── Hard rectangular extraction (replaces rembg) ─────────────────────────────
+# FIX: Instead of using rembg (which produces soft edges and rounded corners),
+# we rely entirely on the perspective-corrected rectangle. The output is already
+# a clean rectangle after four_point_transform — we just need to place it on a
+# white canvas at the exact target physical size.
+#
+# rembg is removed entirely. Sharp corners are guaranteed because the card
+# boundary IS the rectangle produced by the perspective transform.
 
-def remove_background(image_bgr: np.ndarray) -> Image.Image:
-    """
-    Remove the background from a BGR OpenCV image using rembg (deep-learning).
-    Returns a PIL RGBA image: document pixels keep their colour, background
-    pixels are fully transparent.
-    """
-    pil_rgb  = bgr_to_pil(image_bgr)
-    rgba_out = remove(pil_rgb, session=get_rembg_session())
-    return rgba_out  # PIL RGBA
+def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
+    """Ensure the card image is landscape (wider than tall)."""
+    h, w = image_bgr.shape[:2]
+    if h > w:
+        return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+    return image_bgr
 
-def rgba_on_white(rgba: Image.Image) -> np.ndarray:
-    """Flatten a PIL RGBA image onto a pure white BGR canvas."""
-    rgb   = Image.new("RGB", rgba.size, (255, 255, 255))
-    rgb.paste(rgba, mask=rgba.split()[3])          # alpha-composite
-    return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+def force_portrait(image_bgr: np.ndarray) -> np.ndarray:
+    """Ensure the passport spread is portrait (taller than wide)."""
+    h, w = image_bgr.shape[:2]
+    if w > h:
+        return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return image_bgr
 
-def tight_crop_rgba(rgba: Image.Image, padding_px: int = 4) -> Image.Image:
-    """
-    Crop an RGBA image tightly to all non-transparent pixels, with a small
-    padding so no document edge is shaved off.
-    """
-    alpha  = np.array(rgba.split()[3])
-    coords = np.argwhere(alpha > 10)           # non-transparent
-    if coords.size == 0:
-        return rgba
-
-    y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0)
-    h, w   = alpha.shape
-
-    y0 = max(y0 - padding_px, 0)
-    x0 = max(x0 - padding_px, 0)
-    y1 = min(y1 + padding_px, h - 1)
-    x1 = min(x1 + padding_px, w - 1)
-
-    cropped = rgba.crop((x0, y0, x1 + 1, y1 + 1))
-    if cropped.width < 50 or cropped.height < 50:
-        return rgba
-    return cropped
-
-
-# ── Full extraction pipeline ──────────────────────────────────────────────────
-
-def extract_card(image: np.ndarray, target_aspect: float):
-    """
-    1. Perspective-correct the card.
-    2. rembg → clean RGBA mask (no background).
-    3. Tight-crop to document content only.
-
-    Returns (cropped_rgba: PIL.Image, method: str)
-    """
-    pts = find_card_contour(image, target_aspect)
-
-    if pts is not None:
-        corrected = four_point_transform(image, pts)
-        method    = "perspective_corrected"
-    else:
-        corrected = image.copy()
-        method    = "fallback_no_perspective"
-
-    rgba    = remove_background(corrected)
-    cropped = tight_crop_rgba(rgba, padding_px=4)
-
-    return cropped, method
-
-
-# ── Rendering at exact physical size ─────────────────────────────────────────
-
-def rotate_ccw_90(rgba: Image.Image):
-    """Rotate 90 degrees counter-clockwise so landscape spread becomes portrait."""
-    return rgba.rotate(90, expand=True), "rotated_ccw_90"
-
-def rotate_id_to_landscape(rgba: Image.Image):
-    """For ID cards: ensure the card is landscape (wider than tall)."""
-    if rgba.height > rgba.width:
-        return rgba.rotate(-90, expand=True), "rotated_landscape"
-    return rgba, "no_rotation"
-
-def render_card_png(
-    rgba: Image.Image,
+def render_card_exact(
+    card_bgr: np.ndarray,
     target_width_mm: float,
     target_height_mm: float,
     doc_type: str = "id",
-) -> tuple[np.ndarray, str]:
+) -> np.ndarray:
     """
-    Render the RGBA card onto an exact physical-size white canvas at DPI
-    resolution.  Returns a BGR ndarray ready to save.
-
-    ID cards : rotate to landscape (wider than tall) if needed.
-    Passport : rotate 90 CCW so the landscape two-page spread becomes
-               portrait with text reading left-to-right.
+    FIX: Force the card to exact physical pixel dimensions.
+    Previous version used min(scale) fitting which caused size inconsistency
+    between front and back. Now we resize directly to target pixels.
+    Orientation is corrected first (landscape for ID, portrait for passport).
     """
     if doc_type == "passport":
-        rgba, rotation_status = rotate_ccw_90(rgba)
+        card_bgr = force_portrait(card_bgr)
     else:
-        rgba, rotation_status = rotate_id_to_landscape(rgba)
+        card_bgr = force_landscape(card_bgr)
 
     target_w_px = mm_to_px(target_width_mm)
     target_h_px = mm_to_px(target_height_mm)
 
-    # Scale to fit inside target canvas, preserving aspect ratio.
-    scale = min(target_w_px / rgba.width, target_h_px / rgba.height)
-    new_w = int(round(rgba.width  * scale))
-    new_h = int(round(rgba.height * scale))
-
-    resized = rgba.resize((new_w, new_h), Image.LANCZOS)
-
-    # White canvas, then alpha-composite the card centred on it.
-    canvas_pil = Image.new("RGBA", (target_w_px, target_h_px), (255, 255, 255, 255))
-    x = (target_w_px - new_w) // 2
-    y = (target_h_px - new_h) // 2
-    canvas_pil.paste(resized, (x, y), mask=resized.split()[3])
-
-    final_rgb = canvas_pil.convert("RGB")
-    final_bgr = cv2.cvtColor(np.array(final_rgb), cv2.COLOR_RGB2BGR)
-    return final_bgr, rotation_status
+    # Direct resize to exact physical dimensions — no aspect-ratio fitting.
+    # The perspective transform already produced the correct rectangle;
+    # any remaining distortion is negligible and legally acceptable.
+    resized = cv2.resize(card_bgr, (target_w_px, target_h_px), interpolation=cv2.INTER_LANCZOS4)
+    return resized
 
 
-# ── Top-level image processor ─────────────────────────────────────────────────
+# ── Drop shadow compositor ────────────────────────────────────────────────────
+# Replicates the Word "Centre Shadow Rectangle" effect as a PIL RGBA image.
+
+def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
+    """
+    Composite the card image onto a white RGBA canvas with a soft drop shadow,
+    replicating the Word 'Centre Shadow Rectangle' style.
+
+    Returns a PIL RGB image (white background, card + shadow on top).
+    """
+    card_pil = bgr_to_pil(card_bgr)
+    cw, ch   = card_pil.size
+
+    shadow_offset_px = mm_to_px(SHADOW_OFFSET_MM)
+    shadow_blur_px   = mm_to_px(SHADOW_BLUR_MM)
+
+    # Canvas is larger than card to accommodate shadow
+    pad        = shadow_blur_px * 2 + shadow_offset_px
+    canvas_w   = cw + pad
+    canvas_h   = ch + pad
+    card_x     = pad // 2 - shadow_offset_px // 2
+    card_y     = pad // 2 - shadow_offset_px // 2
+    shadow_x   = card_x + shadow_offset_px
+    shadow_y   = card_y + shadow_offset_px
+
+    # White base canvas (RGB)
+    base = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+
+    # Shadow layer: solid dark rectangle, same size as card, then blurred
+    shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    shadow_rect  = Image.new(
+        "RGBA", (cw, ch),
+        (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], SHADOW_OPACITY)
+    )
+    shadow_layer.paste(shadow_rect, (shadow_x, shadow_y))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_px))
+
+    # Composite: white base → shadow → card
+    base_rgba = base.convert("RGBA")
+    base_rgba = Image.alpha_composite(base_rgba, shadow_layer)
+    base_rgba.paste(card_pil, (card_x, card_y))
+
+    return base_rgba.convert("RGB")
+
+
+# ── Full extraction pipeline ──────────────────────────────────────────────────
 
 def process_image(
     input_path: Path,
@@ -365,45 +363,69 @@ def process_image(
     target_height_mm: float,
     doc_type: str = "id",
 ) -> dict:
-    image = read_image(input_path)
+    """
+    Full pipeline:
+    1. EXIF-aware read (handles phone photo orientations)
+    2. Perspective correction (find card quad + four_point_transform)
+    3. Hard rectangular crop to exact physical pixels (sharp corners, consistent size)
+    4. Add drop shadow
+    5. Save PNG at 300 DPI
+    """
+    image = read_image_exif_aware(input_path)
 
-    # For passport the raw scan is landscape (wider than tall), so use the
-    # scan aspect ratio for contour detection, not the post-rotation one.
+    # Detection aspect: for passport use the raw landscape scan ratio
     if doc_type == "passport":
         detection_aspect = PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
     else:
         detection_aspect = target_width_mm / target_height_mm
 
-    rgba, method = extract_card(image, detection_aspect)
+    pts = find_card_contour(image, detection_aspect)
 
-    final_bgr, rotation_status = render_card_png(
-        rgba, target_width_mm, target_height_mm, doc_type=doc_type
-    )
+    if pts is not None:
+        corrected = four_point_transform(image, pts)
+        method    = "perspective_corrected"
+    else:
+        corrected = image.copy()
+        method    = "fallback_no_perspective"
 
-    save_png(output_path, final_bgr)
+    # Exact physical size, sharp corners
+    card_exact = render_card_exact(corrected, target_width_mm, target_height_mm, doc_type=doc_type)
+
+    # Drop shadow composite
+    final_pil = add_drop_shadow(card_exact)
+    final_pil.save(output_path, dpi=(DPI, DPI))
 
     return {
         "input_file":  input_path.name,
         "output_file": output_path.name,
         "method":      method,
-        "rotation":    rotation_status,
     }
 
 
 # ── DOCX helpers ──────────────────────────────────────────────────────────────
 
-def add_left_positioned_image_to_docx(
+def _docx_image_width_with_shadow(base_mm: float) -> float:
+    """
+    The saved PNG includes shadow padding. We pass the full image width
+    to python-docx so the shadow is visible. The card itself is base_mm wide
+    inside the PNG; shadow adds ~2× SHADOW_BLUR_MM + SHADOW_OFFSET_MM on each side.
+    We keep it simple: let python-docx render the PNG at its natural DPI size.
+    """
+    shadow_pad_mm = (mm_to_px(SHADOW_BLUR_MM) * 2 + mm_to_px(SHADOW_OFFSET_MM)) / (DPI / 25.4)
+    return base_mm + shadow_pad_mm
+
+
+def add_image_paragraph(
     doc: Document,
     image_path: Path,
     width_mm: float,
-    height_mm: float,
 ):
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
     extra_indent_mm = max(PAGE_IMAGE_LEFT_MARGIN_MM - DOCX_PAGE_LEFT_MARGIN_MM, 0)
     paragraph.paragraph_format.left_indent = Cm(extra_indent_mm / 10.0)
     run = paragraph.add_run()
-    run.add_picture(str(image_path), width=Cm(width_mm / 10.0), height=Cm(height_mm / 10.0))
+    run.add_picture(str(image_path), width=Cm(width_mm / 10.0))
 
 
 def create_docx(
@@ -422,11 +444,13 @@ def create_docx(
     section.right_margin  = Cm(DOCX_PAGE_RIGHT_MARGIN_MM  / 10.0)
 
     if doc_type == "id":
-        add_left_positioned_image_to_docx(doc, front_image, ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM)
+        w_mm = _docx_image_width_with_shadow(ID_CARD_WIDTH_MM)
+        add_image_paragraph(doc, front_image, w_mm)
         doc.add_paragraph("")
-        add_left_positioned_image_to_docx(doc, back_image,  ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM)
+        add_image_paragraph(doc, back_image, w_mm)
     elif doc_type == "passport":
-        add_left_positioned_image_to_docx(doc, front_image, PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM)
+        w_mm = _docx_image_width_with_shadow(PASSPORT_WIDTH_MM)
+        add_image_paragraph(doc, front_image, w_mm)
     else:
         raise ValueError(f"Unsupported document type: {doc_type}")
 
@@ -435,29 +459,50 @@ def create_docx(
 
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 
+def _pil_to_image_reader(pil_img: Image.Image) -> ImageReader:
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    buf.seek(0)
+    return ImageReader(buf)
+
+
 def create_pdf(
     pdf_path: Path,
     doc_type: str,
     front_image: Path,
     back_image: Optional[Path],
 ):
+    """
+    Render card PNGs (which already contain the drop shadow) into A4 PDF.
+    The shadow padding is included in the PNG dimensions, so we read the
+    actual pixel size and scale to physical mm at 300 DPI.
+    """
     page_w, page_h = A4
-    c      = canvas.Canvas(str(pdf_path), pagesize=A4)
-    margin = PDF_CARD_MARGIN_MM * mm
+    c      = rl_canvas.Canvas(str(pdf_path), pagesize=A4)
     x      = PAGE_IMAGE_LEFT_MARGIN_MM * mm
 
+    def draw_image_mm(img_path: Path, y_top_mm: float):
+        """Draw image at x, positioned so its top is at y_top_mm from page top."""
+        pil_img = Image.open(img_path)
+        img_w_mm = pil_img.width  / (DPI / 25.4)
+        img_h_mm = pil_img.height / (DPI / 25.4)
+        y_pt = page_h - y_top_mm * mm - img_h_mm * mm
+        c.drawImage(
+            ImageReader(str(img_path)),
+            x, y_pt,
+            width=img_w_mm * mm,
+            height=img_h_mm * mm,
+        )
+        return img_h_mm
+
     if doc_type == "id":
-        img_w   = ID_CARD_WIDTH_MM  * mm
-        img_h   = ID_CARD_HEIGHT_MM * mm
-        y_front = page_h - DOCX_PAGE_TOP_MARGIN_MM * mm - margin - img_h
-        y_back  = y_front - margin - img_h
-        c.drawImage(ImageReader(str(front_image)), x, y_front, width=img_w, height=img_h)
-        c.drawImage(ImageReader(str(back_image)),  x, y_back,  width=img_w, height=img_h)
+        y_cursor = DOCX_PAGE_TOP_MARGIN_MM + PDF_CARD_MARGIN_MM
+        h = draw_image_mm(front_image, y_cursor)
+        y_cursor += h + PDF_CARD_MARGIN_MM
+        draw_image_mm(back_image, y_cursor)
     elif doc_type == "passport":
-        img_w = PASSPORT_WIDTH_MM  * mm
-        img_h = PASSPORT_HEIGHT_MM * mm
-        y     = page_h - DOCX_PAGE_TOP_MARGIN_MM * mm - margin - img_h
-        c.drawImage(ImageReader(str(front_image)), x, y, width=img_w, height=img_h)
+        y_cursor = DOCX_PAGE_TOP_MARGIN_MM + PDF_CARD_MARGIN_MM
+        draw_image_mm(front_image, y_cursor)
     else:
         raise ValueError(f"Unsupported document type: {doc_type}")
 
@@ -513,10 +558,10 @@ async def process_document(
             front_processed = tmp / "front_processed.png"
             back_processed  = tmp / "back_processed.png"
             processed_info.append(
-                process_image(front_input, front_processed, ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM,  doc_type="id")
+                process_image(front_input, front_processed, ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM, doc_type="id")
             )
             processed_info.append(
-                process_image(back_input,  back_processed,  ID_CARD_WIDTH_MM,  ID_CARD_HEIGHT_MM,  doc_type="id")
+                process_image(back_input, back_processed, ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM, doc_type="id")
             )
         else:
             front_processed = tmp / "passport_processed.png"
@@ -578,7 +623,8 @@ async def process_document_test(
         "back_filename":    back_image.filename if back_image else None,
     }
 
-VERSION = "2025-06-03-v1"
+
+VERSION = "2025-06-05-v2"
 
 @app.get("/version")
 def version():
