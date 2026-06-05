@@ -7,3 +7,4 @@ python-docx
 reportlab
 python-multipart
 requests
+rembg
