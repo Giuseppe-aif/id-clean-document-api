@@ -18,4 +18,4 @@ RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
 # App code — last, so only this layer rebuilds on code changes
 COPY main.py .
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
