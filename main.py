@@ -9,8 +9,8 @@ import io
 
 import cv2
 import numpy as np
-import requests
 from PIL import Image, ImageFilter, ExifTags
+from rembg import remove, new_session
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -24,18 +24,7 @@ from reportlab.lib.utils import ImageReader
 
 app = FastAPI()
 
-API_KEY      = os.getenv("API_KEY", "")
-MINDEE_KEY   = os.getenv("MINDEE_API_KEY", "")
-
-# ── Mindee endpoints ──────────────────────────────────────────────────────────
-# We use the standalone Cropper API which is purpose-built for document
-# boundary detection. It returns quadrangle coordinates (4 corner points)
-# that we use for perspective correction — no background removal model needed.
-# Docs: https://developers.mindee.com/docs/cropper
-
-MINDEE_CROPPER_URL = (
-    "https://api.mindee.net/v1/products/mindee/cropper/v1/predict"
-)
+API_KEY = os.getenv("API_KEY", "")
 
 # ── Physical document dimensions ──────────────────────────────────────────────
 
@@ -67,9 +56,21 @@ SHADOW_BLUR_MM   = 3.0
 SHADOW_OPACITY   = 160
 SHADOW_COLOR     = (80, 80, 80)
 
-# ── Perspective correction tunables ───────────────────────────────────────────
+# ── rembg / isolation tunables ────────────────────────────────────────────────
 
-ASPECT_TOLERANCE = 0.35
+ALPHA_THRESHOLD       = 10
+TIGHT_CROP_PADDING_PX = 6
+
+
+# ── rembg session (loaded once at startup) ────────────────────────────────────
+
+_REMBG_SESSION = None
+
+def get_rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        _REMBG_SESSION = new_session("isnet-general-use")
+    return _REMBG_SESSION
 
 
 # ── Health endpoints ──────────────────────────────────────────────────────────
@@ -99,7 +100,8 @@ def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
 
 def read_image_exif_aware(path: Path) -> np.ndarray:
     """
-    Read image respecting EXIF orientation.
+    Read image respecting EXIF orientation so phone photos arrive correctly
+    oriented before any processing begins.
     Returns BGR ndarray (OpenCV convention).
     """
     pil_img = Image.open(path)
@@ -128,151 +130,110 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 
-# ── Mindee Cropper ────────────────────────────────────────────────────────────
+# ── rembg isolation + hard rectangular clip ───────────────────────────────────
+#
+# Strategy:
+#   1. rembg (ISNet) removes background — handles any background colour.
+#   2. Find bounding box of non-transparent pixels → hard rectangular clip.
+#      This gives sharp 90° corners instead of rembg's soft edges.
+#   3. Return RGBA with transparent background (not white).
+#      Word and PDF both render on white pages so transparency = white in
+#      practice, but avoids the visible white-box halo artifact.
 
-def get_mindee_quad(image_path: Path) -> Optional[np.ndarray]:
+def isolate_card_transparent(image_bgr: np.ndarray) -> Image.Image:
     """
-    Call Mindee Cropper API and return the document quadrangle as a
-    float32 (4,2) array of pixel coordinates in the original image,
-    or None if detection failed.
-
-    Mindee returns normalized coordinates (0.0–1.0) relative to image
-    dimensions. We multiply by actual pixel dimensions to get absolute coords.
-
-    The quadrangle is a 4-point free polygon that follows the actual card
-    corners even when photographed at an angle — exactly what we need for
-    perspective correction.
+    Use rembg to isolate the card, then clip to a hard axis-aligned rectangle.
+    Returns a PIL RGBA image — card pixels intact, background fully transparent.
+    Sharp 90° corners guaranteed by the bounding box geometry.
     """
-    if not MINDEE_KEY:
-        return None
+    pil_rgb  = bgr_to_pil(image_bgr)
+    rgba_out = remove(pil_rgb, session=get_rembg_session())
 
-    try:
-        with open(image_path, "rb") as f:
-            response = requests.post(
-                MINDEE_CROPPER_URL,
-                headers={"Authorization": f"Token {MINDEE_KEY}"},
-                files={"document": f},
-                timeout=30,
-            )
+    # Find bounding box of non-transparent pixels
+    alpha  = np.array(rgba_out.split()[3])
+    coords = np.argwhere(alpha > ALPHA_THRESHOLD)
 
-        if response.status_code != 200:
-            return None
+    if coords.size == 0:
+        return rgba_out   # rembg removed everything — return as-is
 
-        data    = response.json()
-        pages   = data.get("document", {}).get("inference", {}).get("pages", [])
-        if not pages:
-            return None
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0)
+    h, w   = alpha.shape
 
-        croppings = pages[0].get("extras", {}).get("cropper", {}).get("cropping", [])
-        if not croppings:
-            return None
+    y0 = max(y0 - TIGHT_CROP_PADDING_PX, 0)
+    x0 = max(x0 - TIGHT_CROP_PADDING_PX, 0)
+    y1 = min(y1 + TIGHT_CROP_PADDING_PX, h - 1)
+    x1 = min(x1 + TIGHT_CROP_PADDING_PX, w - 1)
 
-        # Use quadrangle — a free 4-point polygon following the actual card corners
-        # Fall back to rectangle if quadrangle not present
-        quad_norm = croppings[0].get("quadrangle") or croppings[0].get("rectangle")
-        if not quad_norm or len(quad_norm) != 4:
-            return None
+    # Hard rectangular crop — this is what gives sharp corners.
+    # The soft alpha within this rectangle is flattened to fully opaque
+    # so the card edge is a clean hard line, not a feathered rembg edge.
+    rgba_cropped = rgba_out.crop((x0, y0, x1 + 1, y1 + 1))
 
-        # Get actual image dimensions to convert normalized → pixel coords
-        pil_img = Image.open(image_path)
-        w, h    = pil_img.size
+    # Binarise the alpha: anything above threshold → fully opaque (255)
+    # This removes any soft/feathered edge rembg left and gives a hard rect.
+    r, g, b, a = rgba_cropped.split()
+    a_arr = np.array(a)
+    a_arr[a_arr > ALPHA_THRESHOLD] = 255
+    a_arr[a_arr <= ALPHA_THRESHOLD] = 0
+    a_hard = Image.fromarray(a_arr)
+    rgba_hard = Image.merge("RGBA", (r, g, b, a_hard))
 
-        quad_px = np.array(
-            [[pt["x"] * w, pt["y"] * h] for pt in quad_norm],
-            dtype="float32",
-        )
-        return quad_px
-
-    except Exception:
-        return None
-
-
-# ── Perspective correction ────────────────────────────────────────────────────
-
-def order_points(pts: np.ndarray) -> np.ndarray:
-    """Order 4 points: top-left, top-right, bottom-right, bottom-left."""
-    rect = np.zeros((4, 2), dtype="float32")
-    s    = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff    = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Warp image to flat rectangle using 4 corner points."""
-    rect       = order_points(pts)
-    tl, tr, br, bl = rect
-    max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-    max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-    if max_width < 50 or max_height < 50:
-        return image
-    dst = np.array([
-        [0,             0             ],
-        [max_width - 1, 0             ],
-        [max_width - 1, max_height - 1],
-        [0,             max_height - 1],
-    ], dtype="float32")
-    matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(
-        image, matrix, (max_width, max_height), borderValue=(255, 255, 255)
-    )
-
-def is_plausible_aspect(image: np.ndarray, target_aspect: float) -> bool:
-    h, w = image.shape[:2]
-    if h < 1:
-        return False
-    aspect = w / h
-    return (
-        abs(aspect - target_aspect)         <= ASPECT_TOLERANCE or
-        abs((1.0 / aspect) - target_aspect) <= ASPECT_TOLERANCE
-    )
+    return rgba_hard
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
-def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
-    h, w = image_bgr.shape[:2]
+def force_landscape(rgba: Image.Image) -> Image.Image:
+    """Rotate to landscape (wider than tall) if needed — for ID cards."""
+    w, h = rgba.size
     if h > w:
-        return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
-    return image_bgr
+        return rgba.rotate(-90, expand=True)
+    return rgba
 
-def force_passport_orientation(image_bgr: np.ndarray) -> np.ndarray:
-    """Always produce portrait (taller than wide) with CCW rotation."""
-    h, w = image_bgr.shape[:2]
+def force_passport_orientation(rgba: Image.Image) -> Image.Image:
+    """Always rotate 90° CCW to produce correct portrait passport output."""
+    w, h = rgba.size
     if h > w:
-        image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
-    return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        rgba = rgba.rotate(90, expand=True)   # normalise to landscape first
+    return rgba.rotate(90, expand=True)        # then CCW to portrait
 
 
 # ── Exact-size renderer ───────────────────────────────────────────────────────
 
 def render_card_exact(
-    card_bgr: np.ndarray,
+    rgba: Image.Image,
     target_width_mm: float,
     target_height_mm: float,
     doc_type: str = "id",
-) -> np.ndarray:
+) -> Image.Image:
+    """
+    Resize the isolated card RGBA to exact physical pixel dimensions.
+    Orientation is normalised first.
+    Both front and back always produce identical pixel dimensions.
+    """
     if doc_type == "passport":
-        card_bgr = force_passport_orientation(card_bgr)
+        rgba = force_passport_orientation(rgba)
     else:
-        card_bgr = force_landscape(card_bgr)
+        rgba = force_landscape(rgba)
 
     target_w_px = mm_to_px(target_width_mm)
     target_h_px = mm_to_px(target_height_mm)
-    return cv2.resize(card_bgr, (target_w_px, target_h_px), interpolation=cv2.INTER_LANCZOS4)
+    return rgba.resize((target_w_px, target_h_px), Image.LANCZOS)
 
 
 # ── Drop shadow compositor ────────────────────────────────────────────────────
 
-def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
+def add_drop_shadow(card_rgba: Image.Image) -> Image.Image:
     """
-    Composite card on white canvas with Gaussian drop shadow,
-    replicating the Word 'Centre Shadow Rectangle' style.
+    Composite the RGBA card onto a white canvas with a soft Gaussian drop
+    shadow, replicating the Word 'Centre Shadow Rectangle' style.
+
+    Using the RGBA card (transparent background) means the shadow is cast
+    only by the card pixels — no white-box halo visible.
+    Returns a PIL RGB image ready to save as PNG.
     """
-    card_pil = bgr_to_pil(card_bgr)
-    cw, ch   = card_pil.size
+    cw, ch = card_rgba.size
 
     shadow_offset_px = mm_to_px(SHADOW_OFFSET_MM)
     shadow_blur_px   = mm_to_px(SHADOW_BLUR_MM)
@@ -285,18 +246,25 @@ def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
     shadow_x = card_x + shadow_offset_px
     shadow_y = card_y + shadow_offset_px
 
+    # White base
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
+    # Shadow: use card's alpha channel as shadow shape → blur it
+    # This makes the shadow follow the exact card outline
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
-    shadow_rect  = Image.new(
+    shadow_card  = Image.new(
         "RGBA", (cw, ch),
-        (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], SHADOW_OPACITY),
+        (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], 0),
     )
-    shadow_layer.paste(shadow_rect, (shadow_x, shadow_y))
+    # Fill shadow using the card's own alpha as a mask
+    shadow_alpha = card_rgba.split()[3].point(lambda x: int(x * SHADOW_OPACITY / 255))
+    shadow_card.putalpha(shadow_alpha)
+    shadow_layer.paste(shadow_card, (shadow_x, shadow_y))
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_px))
 
+    # Composite: base → shadow → card (card uses its own alpha)
     base = Image.alpha_composite(base, shadow_layer)
-    base.paste(card_pil, (card_x, card_y))
+    base.paste(card_rgba, (card_x, card_y), mask=card_rgba.split()[3])
 
     return base.convert("RGB")
 
@@ -322,39 +290,23 @@ def process_image(
     """
     Pipeline:
     1. EXIF-aware read        — correct phone photo orientation
-    2. Mindee Cropper API     — detect document quad corners (handles any background,
-                                holographic patches, reflections — trained on real IDs)
-    3. Perspective correction — four_point_transform using Mindee quad
+    2. rembg isolation        — remove any background (ISNet model)
+    3. Hard rectangular clip  — sharp 90° corners, transparent background
     4. Exact physical resize  — consistent size, correct mm at 300 DPI
-    5. Drop shadow            — scanned appearance
+    5. Drop shadow composite  — shadow follows card alpha, no white halo
     6. Save PNG at 300 DPI
     """
     image = read_image_exif_aware(input_path)
 
-    target_aspect = (
-        PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
-        if doc_type == "passport"
-        else target_width_mm / target_height_mm
-    )
+    # Step 2–3: isolate, hard rect, transparent bg
+    card_rgba = isolate_card_transparent(image)
+    method    = "rembg_hard_rect_transparent"
 
-    # ── Step 2: Mindee Cropper ─────────────────────────────────────────────
-    quad   = get_mindee_quad(input_path)
-    method = "fallback_no_correction"
+    # Step 4: exact physical size + orientation
+    card_exact = render_card_exact(card_rgba, target_width_mm, target_height_mm, doc_type=doc_type)
 
-    if quad is not None:
-        corrected = four_point_transform(image, quad)
-        if is_plausible_aspect(corrected, target_aspect):
-            image  = corrected
-            method = "mindee_cropper_perspective_corrected"
-        else:
-            # Mindee found something but wrong aspect — use original
-            method = "mindee_cropper_aspect_mismatch"
-    else:
-        method = "mindee_unavailable_no_correction"
-
-    # ── Steps 4–6 ─────────────────────────────────────────────────────────
-    card_exact = render_card_exact(image, target_width_mm, target_height_mm, doc_type=doc_type)
-    final_pil  = add_drop_shadow(card_exact)
+    # Step 5–6: shadow + save
+    final_pil = add_drop_shadow(card_exact)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
     return {
@@ -557,7 +509,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-05-v7"
+VERSION = "2025-06-05-v8"
 
 @app.get("/version")
 def version():
