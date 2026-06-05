@@ -3,9 +3,8 @@ uvicorn
 opencv-python-headless
 numpy
 pillow
+rembg
+onnxruntime
 python-docx
 reportlab
 python-multipart
-requests
-rembg
-rembg[cpu]
