@@ -10,6 +10,7 @@ import io
 import cv2
 import numpy as np
 from PIL import Image, ImageFilter, ExifTags
+from rembg import remove, new_session
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -31,7 +32,7 @@ ID_CARD_WIDTH_MM  = 85.60
 ID_CARD_HEIGHT_MM = 53.98
 
 # Passport: raw scan is a landscape two-page spread (176 × 125 mm).
-# We rotate it 90° CCW → portrait on A4: width=125 mm, height=176 mm.
+# After 90° CCW rotation → portrait on A4: width=125 mm, height=176 mm.
 PASSPORT_SCAN_WIDTH_MM  = 176.0
 PASSPORT_SCAN_HEIGHT_MM = 125.0
 
@@ -52,15 +53,34 @@ PDF_CARD_MARGIN_MM        = 8.0
 
 # ── Shadow settings ───────────────────────────────────────────────────────────
 
-SHADOW_OFFSET_MM = 2.0    # right + down offset in mm
-SHADOW_BLUR_MM   = 3.0    # Gaussian blur radius in mm
-SHADOW_OPACITY   = 160    # 0–255; 160 ≈ 63 % (matches Word "Centre Shadow Rectangle")
+SHADOW_OFFSET_MM = 2.0   # right + down offset in mm
+SHADOW_BLUR_MM   = 3.0   # Gaussian blur radius in mm
+SHADOW_OPACITY   = 160   # 0–255; 160 ≈ 63 % (matches Word "Centre Shadow Rectangle")
 SHADOW_COLOR     = (80, 80, 80)
 
-# ── Detection tunables ────────────────────────────────────────────────────────
+# ── rembg / isolation tunables ────────────────────────────────────────────────
 
-ASPECT_TOLERANCE    = 0.35   # widened slightly to handle more real-world photos
-MIN_CARD_AREA_RATIO = 0.05   # lowered: light-coloured cards with small dark area still qualify
+# Alpha threshold: pixels with alpha < this value are considered background.
+# 10 is intentionally low so we don't shave any card edge.
+ALPHA_THRESHOLD = 10
+
+# Padding added around the tight alpha bounding box before the hard rect clip.
+# Prevents the detector from shaving a pixel or two off the card edge.
+TIGHT_CROP_PADDING_PX = 6
+
+
+# ── rembg session (loaded once at startup) ────────────────────────────────────
+
+_REMBG_SESSION = None
+
+def get_rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        # isnet-general-use: best quality for document/object isolation.
+        # Falls back gracefully if the model weights are not cached yet
+        # (they are downloaded on first use).
+        _REMBG_SESSION = new_session("isnet-general-use")
+    return _REMBG_SESSION
 
 
 # ── Health endpoints ──────────────────────────────────────────────────────────
@@ -90,8 +110,8 @@ def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
 
 def read_image_exif_aware(path: Path) -> np.ndarray:
     """
-    Read an image respecting EXIF orientation so phone photos arrive
-    correctly oriented regardless of how the camera stored them.
+    Read an image respecting EXIF orientation so phone photos taken sideways
+    arrive correctly oriented before any processing begins.
     Returns a BGR ndarray (OpenCV convention).
     """
     pil_img = Image.open(path)
@@ -120,206 +140,72 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 
-# ── Perspective correction ────────────────────────────────────────────────────
+# ── rembg isolation + hard rectangular clip ───────────────────────────────────
+#
+# Strategy:
+#   1. rembg (ISNet) removes the background and returns an RGBA image.
+#      ISNet handles any background colour — white marble, wood, desk, etc.
+#      This solves the core detection problem that defeated the contour approach.
+#
+#   2. We do NOT use rembg's soft alpha mask as the card boundary.
+#      Instead we find the axis-aligned bounding box of all non-transparent
+#      pixels and crop to that rectangle — giving perfectly sharp 90° corners.
+#
+#   3. A small padding keeps us from shaving actual card pixels at the edge.
+#
+# Result: clean card isolation on any background + sharp rectangular corners.
 
-def resize_for_detection(image: np.ndarray, max_dim: int = 1500):
-    h, w = image.shape[:2]
-    largest = max(h, w)
-    if largest <= max_dim:
-        return image.copy(), 1.0
-    scale = max_dim / float(largest)
-    return cv2.resize(image, (int(w * scale), int(h * scale))), scale
-
-def order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    rect = order_points(pts)
-    tl, tr, br, bl = rect
-    max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-    max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-    if max_width < 50 or max_height < 50:
-        return image
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1],
-    ], dtype="float32")
-    matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(
-        image, matrix, (max_width, max_height), borderValue=(255, 255, 255)
-    )
-
-def build_card_mask_morphological(gray: np.ndarray) -> np.ndarray:
+def isolate_card_hard_rect(image_bgr: np.ndarray) -> np.ndarray:
     """
-    Primary detection strategy: threshold + morphological closing + flood fill.
-    Works well when the card has clear contrast against the background.
+    Use rembg to isolate the card from any background, then clip to a hard
+    axis-aligned rectangle derived from the alpha bounding box.
+
+    Returns a BGR ndarray containing only the card on a white background,
+    tightly cropped with sharp corners.
     """
-    _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
-    close_size = max(gray.shape) // 20
-    if close_size % 2 == 0:
-        close_size += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-    flood = closed.copy()
-    fmask = np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), dtype=np.uint8)
-    cv2.floodFill(flood, fmask, (0, 0), 255)
-    filled = cv2.bitwise_not(flood)
-    return cv2.bitwise_or(closed, filled)
+    # Step 1 — background removal via ISNet deep-learning model
+    pil_rgb  = bgr_to_pil(image_bgr)
+    rgba_out = remove(pil_rgb, session=get_rembg_session())   # PIL RGBA
 
-def build_card_mask_edges(gray: np.ndarray) -> np.ndarray:
-    """
-    Fallback detection strategy: Canny edge detection + dilation + flood fill.
-    Works better when the card is light-coloured and blends with the background
-    (e.g. white/grey card on white table) — the morphological threshold fails
-    in that case because there is not enough pixel-level contrast, but the card
-    edges are still detectable via gradient.
-    """
-    # CLAHE boosts local contrast so even faint edges become detectable
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    # Step 2 — find bounding box of non-transparent pixels
+    alpha  = np.array(rgba_out.split()[3])                    # alpha channel
+    coords = np.argwhere(alpha > ALPHA_THRESHOLD)             # (row, col) pairs
 
-    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-    edges   = cv2.Canny(blurred, 30, 100)
+    if coords.size == 0:
+        # rembg removed everything — return original image (rare failure mode)
+        return image_bgr
 
-    # Dilate edges to close gaps, then flood-fill to get a solid mask
-    dil_size = max(gray.shape) // 40
-    if dil_size % 2 == 0:
-        dil_size += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dil_size, dil_size))
-    dilated = cv2.dilate(edges, kernel, iterations=2)
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0)
+    h, w   = alpha.shape
 
-    flood = dilated.copy()
-    fmask = np.zeros((dilated.shape[0] + 2, dilated.shape[1] + 2), dtype=np.uint8)
-    cv2.floodFill(flood, fmask, (0, 0), 255)
-    filled = cv2.bitwise_not(flood)
-    return cv2.bitwise_or(dilated, filled)
+    # Add padding, clamped to image bounds
+    y0 = max(y0 - TIGHT_CROP_PADDING_PX, 0)
+    x0 = max(x0 - TIGHT_CROP_PADDING_PX, 0)
+    y1 = min(y1 + TIGHT_CROP_PADDING_PX, h - 1)
+    x1 = min(x1 + TIGHT_CROP_PADDING_PX, w - 1)
 
-def contour_to_quad(contour: np.ndarray) -> np.ndarray:
-    hull = cv2.convexHull(contour)
-    perimeter = cv2.arcLength(hull, True)
-    for eps in [0.02, 0.03, 0.05, 0.08]:
-        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype("float32")
-    rect = cv2.minAreaRect(hull)
-    return cv2.boxPoints(rect).astype("float32")
+    # Step 3 — crop to bounding box (hard rectangle, not soft alpha shape)
+    rgba_cropped = rgba_out.crop((x0, y0, x1 + 1, y1 + 1))
 
-def _search_contours(
-    mask: np.ndarray,
-    img_area: int,
-    target_aspect: float,
-    scale: float,
-) -> tuple[Optional[np.ndarray], float]:
-    """
-    Search a binary mask for the best card-shaped contour.
-    Returns (pts_in_original_coords, best_area) or (None, 0).
-    """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_pts  = None
-    best_area = 0.0
+    # Step 4 — flatten onto white background (alpha-composite)
+    white = Image.new("RGB", rgba_cropped.size, (255, 255, 255))
+    white.paste(rgba_cropped, mask=rgba_cropped.split()[3])
 
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
-        area = cv2.contourArea(contour)
-        if area < img_area * MIN_CARD_AREA_RATIO:
-            break
-
-        pts  = contour_to_quad(contour)
-        rect = order_points(pts)
-        tl, tr, br, bl = rect
-
-        card_w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
-        card_h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
-        if card_h < 1:
-            continue
-
-        aspect = card_w / card_h
-        if (abs(aspect - target_aspect)         > ASPECT_TOLERANCE and
-                abs((1.0 / aspect) - target_aspect) > ASPECT_TOLERANCE):
-            continue
-
-        if area > best_area:
-            best_area = area
-            best_pts  = pts / scale
-
-    return best_pts, best_area
-
-def _is_plausibly_corrected(corrected: np.ndarray, target_aspect: float) -> bool:
-    """
-    After four_point_transform, check that the resulting image aspect ratio
-    is close to what we expect. If not, the quad detection found the wrong shape.
-    """
-    h, w = corrected.shape[:2]
-    if h < 1:
-        return False
-    aspect = w / h
-    return (abs(aspect - target_aspect)         <= ASPECT_TOLERANCE or
-            abs((1.0 / aspect) - target_aspect) <= ASPECT_TOLERANCE)
-
-def find_card_contour(image: np.ndarray, target_aspect: float) -> Optional[np.ndarray]:
-    """
-    Two-pass card detector:
-
-    Pass 1 — morphological threshold mask (fast, works on most photos)
-    Pass 2 — CLAHE + Canny edge mask (robust fallback for light-coloured cards
-              on light backgrounds, e.g. the back of many European ID cards)
-
-    If Pass 1 finds a plausible quad AND the perspective-corrected result has
-    a sensible aspect ratio, it is used.  Otherwise Pass 2 is tried.
-    If both fail, None is returned and the pipeline falls back to no correction.
-    """
-    resized, scale = resize_for_detection(image, max_dim=1500)
-    img_area       = resized.shape[0] * resized.shape[1]
-    gray           = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    gray_blurred   = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # ── Pass 1: morphological ──────────────────────────────────────────────
-    mask1 = build_card_mask_morphological(gray_blurred)
-    pts1, area1 = _search_contours(mask1, img_area, target_aspect, scale)
-
-    if pts1 is not None:
-        candidate = four_point_transform(image, pts1)
-        if _is_plausibly_corrected(candidate, target_aspect):
-            return pts1
-        # Found something but aspect ratio wrong — don't give up yet
-
-    # ── Pass 2: edge-based ─────────────────────────────────────────────────
-    mask2 = build_card_mask_edges(gray_blurred)
-    pts2, area2 = _search_contours(mask2, img_area, target_aspect, scale)
-
-    if pts2 is not None:
-        candidate2 = four_point_transform(image, pts2)
-        if _is_plausibly_corrected(candidate2, target_aspect):
-            return pts2
-
-    # ── Last resort: return whichever pass had the larger hit ─────────────
-    if pts1 is not None and pts2 is None:
-        return pts1
-    if pts2 is not None and pts1 is None:
-        return pts2
-    if pts1 is not None and pts2 is not None:
-        return pts1 if area1 >= area2 else pts2
-
-    return None
+    return cv2.cvtColor(np.array(white), cv2.COLOR_RGB2BGR)
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
 def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
+    """Rotate to landscape (wider than tall) if needed — for ID cards."""
     h, w = image_bgr.shape[:2]
     if h > w:
         return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
     return image_bgr
 
 def force_portrait(image_bgr: np.ndarray) -> np.ndarray:
+    """Rotate to portrait (taller than wide) if needed — for passport spreads."""
     h, w = image_bgr.shape[:2]
     if w > h:
         return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -335,9 +221,9 @@ def render_card_exact(
     doc_type: str = "id",
 ) -> np.ndarray:
     """
-    Resize the perspective-corrected card to exact physical pixel dimensions.
+    Resize the isolated card to exact physical pixel dimensions at DPI.
     Orientation is normalised first (landscape for ID, portrait for passport).
-    Both front and back will always produce identical pixel dimensions.
+    Both front and back always produce identical pixel dimensions.
     """
     if doc_type == "passport":
         card_bgr = force_portrait(card_bgr)
@@ -374,7 +260,7 @@ def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
     # White base
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
-    # Shadow: solid rect → blur
+    # Shadow: solid rect the size of the card → Gaussian blur
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
     shadow_rect  = Image.new(
         "RGBA", (cw, ch),
@@ -390,13 +276,12 @@ def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
     return base.convert("RGB")
 
 
-# ── PIL → ReportLab ImageReader (preserves full quality) ─────────────────────
+# ── PIL → ReportLab ImageReader ───────────────────────────────────────────────
 
 def pil_to_image_reader(pil_img: Image.Image) -> ImageReader:
     """
-    Convert a PIL image to a ReportLab ImageReader via an in-memory PNG buffer.
-    Using this instead of ImageReader(filepath) ensures the shadow (which is
-    stored in PNG metadata) is rendered correctly at the right DPI in the PDF.
+    Load a PIL image into a ReportLab ImageReader via an in-memory buffer.
+    This preserves shadow quality in the PDF (ImageReader(filepath) loses it).
     """
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG", dpi=(DPI, DPI))
@@ -414,31 +299,25 @@ def process_image(
     doc_type: str = "id",
 ) -> dict:
     """
-    1. EXIF-aware read
-    2. Two-pass perspective detection + correction
-    3. Exact physical resize (sharp corners, consistent size)
-    4. Drop shadow composite
-    5. Save PNG at 300 DPI
+    Pipeline:
+    1. EXIF-aware read          — correct phone photo orientation
+    2. rembg isolation          — remove any background (white marble, desk, etc.)
+    3. Hard rectangular clip    — sharp 90° corners from alpha bounding box
+    4. Exact physical resize    — consistent size, correct mm at 300 DPI
+    5. Drop shadow composite    — "scanned" appearance
+    6. Save PNG at 300 DPI
     """
     image = read_image_exif_aware(input_path)
 
-    detection_aspect = (
-        PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
-        if doc_type == "passport"
-        else target_width_mm / target_height_mm
-    )
+    # ── Step 2–3: isolate card, hard rect clip ─────────────────────────────
+    card_bgr = isolate_card_hard_rect(image)
+    method   = "rembg_hard_rect"
 
-    pts = find_card_contour(image, detection_aspect)
+    # ── Step 4: exact physical size + orientation ──────────────────────────
+    card_exact = render_card_exact(card_bgr, target_width_mm, target_height_mm, doc_type=doc_type)
 
-    if pts is not None:
-        corrected = four_point_transform(image, pts)
-        method    = "perspective_corrected"
-    else:
-        corrected = image.copy()
-        method    = "fallback_no_perspective"
-
-    card_exact = render_card_exact(corrected, target_width_mm, target_height_mm, doc_type=doc_type)
-    final_pil  = add_drop_shadow(card_exact)
+    # ── Step 5–6: shadow + save ────────────────────────────────────────────
+    final_pil = add_drop_shadow(card_exact)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
     return {
@@ -451,10 +330,7 @@ def process_image(
 # ── DOCX helpers ──────────────────────────────────────────────────────────────
 
 def _image_display_width_mm(base_mm: float) -> float:
-    """
-    The PNG includes shadow padding around the card.
-    Compute the total width in mm so python-docx renders it at natural size.
-    """
+    """Total PNG width in mm, including shadow padding."""
     pad_px = mm_to_px(SHADOW_BLUR_MM) * 2 + mm_to_px(SHADOW_OFFSET_MM)
     pad_mm = pad_px / (DPI / 25.4)
     return base_mm + pad_mm
@@ -507,22 +383,20 @@ def create_pdf(
     back_image: Optional[Path],
 ):
     """
-    Place card PNGs (shadow already baked in) onto an A4 page.
-    PNG pixel dimensions are read and converted to mm at 300 DPI so the card
-    renders at exactly the correct physical size.
-    Images are loaded via pil_to_image_reader so shadow quality is preserved.
+    Place card PNGs (shadow baked in) onto an A4 page at correct physical size.
+    PNG pixel dimensions are read and converted to mm at DPI — no hardcoding.
+    Images pass through pil_to_image_reader so shadow is preserved in the PDF.
     """
     page_w, page_h = A4
     c = rl_canvas.Canvas(str(pdf_path), pagesize=A4)
     x = PAGE_IMAGE_LEFT_MARGIN_MM * mm
 
     def draw(img_path: Path, y_top_mm: float) -> float:
-        """Draw one card image; return its height in mm."""
-        pil_img  = Image.open(img_path)
-        w_mm     = pil_img.width  / (DPI / 25.4)
-        h_mm     = pil_img.height / (DPI / 25.4)
-        y_pt     = page_h - y_top_mm * mm - h_mm * mm
-        reader   = pil_to_image_reader(pil_img)   # FIX: was ImageReader(filepath) — shadow lost
+        pil_img = Image.open(img_path)
+        w_mm    = pil_img.width  / (DPI / 25.4)
+        h_mm    = pil_img.height / (DPI / 25.4)
+        y_pt    = page_h - y_top_mm * mm - h_mm * mm
+        reader  = pil_to_image_reader(pil_img)
         c.drawImage(reader, x, y_pt, width=w_mm * mm, height=h_mm * mm, mask="auto")
         return h_mm
 
@@ -652,7 +526,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-05-v3"
+VERSION = "2025-06-05-v4"
 
 @app.get("/version")
 def version():
