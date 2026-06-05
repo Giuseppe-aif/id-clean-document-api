@@ -6,4 +6,3 @@ pillow
 rembg
 python-docx
 reportlab
-rembg
