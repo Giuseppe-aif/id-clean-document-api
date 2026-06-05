@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
 
-# v5 - cache bust
+# cache-bust 2025-06-05-v5-final
+ARG CACHEBUST=1
 COPY main.py .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
