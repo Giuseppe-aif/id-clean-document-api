@@ -9,8 +9,8 @@ import io
 
 import cv2
 import numpy as np
+import requests
 from PIL import Image, ImageFilter, ExifTags
-from rembg import remove, new_session
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -24,15 +24,24 @@ from reportlab.lib.utils import ImageReader
 
 app = FastAPI()
 
-API_KEY = os.getenv("API_KEY", "")
+API_KEY      = os.getenv("API_KEY", "")
+MINDEE_KEY   = os.getenv("MINDEE_API_KEY", "")
+
+# ── Mindee endpoints ──────────────────────────────────────────────────────────
+# We use the standalone Cropper API which is purpose-built for document
+# boundary detection. It returns quadrangle coordinates (4 corner points)
+# that we use for perspective correction — no background removal model needed.
+# Docs: https://developers.mindee.com/docs/cropper
+
+MINDEE_CROPPER_URL = (
+    "https://api.mindee.net/v1/products/mindee/cropper/v1/predict"
+)
 
 # ── Physical document dimensions ──────────────────────────────────────────────
 
 ID_CARD_WIDTH_MM  = 85.60
 ID_CARD_HEIGHT_MM = 53.98
 
-# Passport: raw scan is a landscape two-page spread (176 × 125 mm).
-# After 90° CCW rotation → portrait on A4: width=125 mm, height=176 mm.
 PASSPORT_SCAN_WIDTH_MM  = 176.0
 PASSPORT_SCAN_HEIGHT_MM = 125.0
 
@@ -58,34 +67,9 @@ SHADOW_BLUR_MM   = 3.0
 SHADOW_OPACITY   = 160
 SHADOW_COLOR     = (80, 80, 80)
 
-# ── rembg / isolation tunables ────────────────────────────────────────────────
+# ── Perspective correction tunables ───────────────────────────────────────────
 
-# Alpha threshold for non-transparent pixel detection
-ALPHA_THRESHOLD = 10
-
-# Alpha matting parameters (from rembg official docs)
-# These reduce the white halo around the card edges
-ALPHA_MATTING_FG_THRESHOLD  = 270
-ALPHA_MATTING_BG_THRESHOLD  = 20
-ALPHA_MATTING_ERODE_SIZE    = 11
-
-# Perspective correction from alpha mask
-# Aspect ratio tolerance when validating detected quad
 ASPECT_TOLERANCE = 0.35
-
-# Padding around the final crop
-TIGHT_CROP_PADDING_PX = 4
-
-
-# ── rembg session (loaded once at startup) ────────────────────────────────────
-
-_REMBG_SESSION = None
-
-def get_rembg_session():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None:
-        _REMBG_SESSION = new_session("isnet-general-use")
-    return _REMBG_SESSION
 
 
 # ── Health endpoints ──────────────────────────────────────────────────────────
@@ -115,9 +99,8 @@ def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
 
 def read_image_exif_aware(path: Path) -> np.ndarray:
     """
-    Read an image respecting EXIF orientation so phone photos taken sideways
-    arrive correctly oriented before any processing begins.
-    Returns a BGR ndarray (OpenCV convention).
+    Read image respecting EXIF orientation.
+    Returns BGR ndarray (OpenCV convention).
     """
     pil_img = Image.open(path)
     try:
@@ -145,192 +128,106 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 
-# ── Perspective correction helpers ────────────────────────────────────────────
+# ── Mindee Cropper ────────────────────────────────────────────────────────────
+
+def get_mindee_quad(image_path: Path) -> Optional[np.ndarray]:
+    """
+    Call Mindee Cropper API and return the document quadrangle as a
+    float32 (4,2) array of pixel coordinates in the original image,
+    or None if detection failed.
+
+    Mindee returns normalized coordinates (0.0–1.0) relative to image
+    dimensions. We multiply by actual pixel dimensions to get absolute coords.
+
+    The quadrangle is a 4-point free polygon that follows the actual card
+    corners even when photographed at an angle — exactly what we need for
+    perspective correction.
+    """
+    if not MINDEE_KEY:
+        return None
+
+    try:
+        with open(image_path, "rb") as f:
+            response = requests.post(
+                MINDEE_CROPPER_URL,
+                headers={"Authorization": f"Token {MINDEE_KEY}"},
+                files={"document": f},
+                timeout=30,
+            )
+
+        if response.status_code != 200:
+            return None
+
+        data    = response.json()
+        pages   = data.get("document", {}).get("inference", {}).get("pages", [])
+        if not pages:
+            return None
+
+        croppings = pages[0].get("extras", {}).get("cropper", {}).get("cropping", [])
+        if not croppings:
+            return None
+
+        # Use quadrangle — a free 4-point polygon following the actual card corners
+        # Fall back to rectangle if quadrangle not present
+        quad_norm = croppings[0].get("quadrangle") or croppings[0].get("rectangle")
+        if not quad_norm or len(quad_norm) != 4:
+            return None
+
+        # Get actual image dimensions to convert normalized → pixel coords
+        pil_img = Image.open(image_path)
+        w, h    = pil_img.size
+
+        quad_px = np.array(
+            [[pt["x"] * w, pt["y"] * h] for pt in quad_norm],
+            dtype="float32",
+        )
+        return quad_px
+
+    except Exception:
+        return None
+
+
+# ── Perspective correction ────────────────────────────────────────────────────
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     """Order 4 points: top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
+    s    = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
     rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
+    diff    = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Warp image to a flat rectangle defined by 4 corner points."""
-    rect = order_points(pts)
+    """Warp image to flat rectangle using 4 corner points."""
+    rect       = order_points(pts)
     tl, tr, br, bl = rect
     max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
     max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
     if max_width < 50 or max_height < 50:
         return image
     dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
+        [0,             0             ],
+        [max_width - 1, 0             ],
         [max_width - 1, max_height - 1],
-        [0, max_height - 1],
+        [0,             max_height - 1],
     ], dtype="float32")
     matrix = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(
         image, matrix, (max_width, max_height), borderValue=(255, 255, 255)
     )
 
-def find_quad_from_alpha(alpha: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Find the 4-corner quad of the card from the rembg alpha mask.
-
-    Using the alpha mask (not the original image) is much more reliable:
-    rembg has already cleanly separated the card from any background, so
-    the contour we find here is the actual card outline — no background
-    confusion, no contrast dependency.
-
-    Returns a float32 (4,2) array of corner points, or None if no clean
-    quad is found.
-    """
-    # Threshold the alpha mask to binary
-    _, binary = cv2.threshold(alpha, ALPHA_THRESHOLD, 255, cv2.THRESH_BINARY)
-
-    # Light morphological close to fill tiny gaps at card edges
-    kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    # Take the largest contour — that's the card
-    contour  = max(contours, key=cv2.contourArea)
-    hull     = cv2.convexHull(contour)
-    perim    = cv2.arcLength(hull, True)
-
-    # Try progressively looser approximations until we get 4 points
-    for eps in [0.02, 0.03, 0.05, 0.08, 0.10]:
-        approx = cv2.approxPolyDP(hull, eps * perim, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype("float32")
-
-    # Fallback: use minimum area rectangle
-    rect = cv2.minAreaRect(hull)
-    return cv2.boxPoints(rect).astype("float32")
-
-
-# ── Core isolation pipeline ───────────────────────────────────────────────────
-
-def isolate_and_correct(image_bgr: np.ndarray, target_aspect: float) -> tuple[np.ndarray, str]:
-    """
-    Full isolation pipeline:
-
-    1. rembg (ISNet) removes the background with alpha matting for clean edges.
-       Alpha matting is documented in rembg official docs and specifically
-       reduces the white halo artifact around object edges.
-
-    2. Find the card's 4 corners from the clean alpha mask.
-       Using the alpha mask instead of the original image is far more reliable —
-       rembg has already solved the background separation problem, so the
-       contour we find is the actual card outline with no background interference.
-
-    3. Apply perspective correction (four_point_transform) to flatten any angle.
-       This corrects photos taken at slight angles — the card need not be
-       photographed perfectly perpendicular to work correctly.
-
-    4. Flatten onto white, resize to exact physical dimensions.
-
-    Returns (card_bgr, method_string).
-    """
-    pil_rgb = bgr_to_pil(image_bgr)
-
-    # Step 1 — rembg with alpha matting (reduces halo)
-    try:
-        rgba_out = remove(
-            pil_rgb,
-            session=get_rembg_session(),
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=ALPHA_MATTING_FG_THRESHOLD,
-            alpha_matting_background_threshold=ALPHA_MATTING_BG_THRESHOLD,
-            alpha_matting_erode_size=ALPHA_MATTING_ERODE_SIZE,
-            post_process_mask=True,
-        )
-    except Exception:
-        # Alpha matting can fail on some images — fall back to standard removal
-        rgba_out = remove(pil_rgb, session=get_rembg_session(), post_process_mask=True)
-
-    alpha = np.array(rgba_out.split()[3])
-
-    # Step 2 — find quad from alpha mask
-    quad = find_quad_from_alpha(alpha)
-
-    if quad is not None:
-        # Validate aspect ratio of detected quad
-        rect      = order_points(quad)
-        tl, tr, br, bl = rect
-        card_w    = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
-        card_h    = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
-        if card_h > 0:
-            aspect = card_w / card_h
-            aspect_ok = (
-                abs(aspect - target_aspect)         <= ASPECT_TOLERANCE or
-                abs((1.0 / aspect) - target_aspect) <= ASPECT_TOLERANCE
-            )
-        else:
-            aspect_ok = False
-
-        if aspect_ok:
-            # Step 3 — perspective correct using the RGBA image
-            rgba_arr      = np.array(rgba_out)
-            corrected_arr = cv2.warpPerspective(
-                rgba_arr, cv2.getPerspectiveTransform(
-                    order_points(quad),
-                    np.array([
-                        [0, 0],
-                        [int(max(np.linalg.norm(rect[1]-rect[0]), np.linalg.norm(rect[2]-rect[3])))-1, 0],
-                        [int(max(np.linalg.norm(rect[1]-rect[0]), np.linalg.norm(rect[2]-rect[3])))-1,
-                         int(max(np.linalg.norm(rect[3]-rect[0]), np.linalg.norm(rect[2]-rect[1])))-1],
-                        [0, int(max(np.linalg.norm(rect[3]-rect[0]), np.linalg.norm(rect[2]-rect[1])))-1],
-                    ], dtype="float32")
-                ),
-                (
-                    int(max(np.linalg.norm(rect[1]-rect[0]), np.linalg.norm(rect[2]-rect[3]))),
-                    int(max(np.linalg.norm(rect[3]-rect[0]), np.linalg.norm(rect[2]-rect[1]))),
-                ),
-                borderValue=(255, 255, 255, 0),
-            )
-            rgba_corrected = Image.fromarray(corrected_arr, "RGBA")
-            method = "rembg_alpha_matting_perspective_corrected"
-        else:
-            # Quad found but wrong aspect — skip perspective correction
-            rgba_corrected = rgba_out
-            method = "rembg_alpha_matting_no_perspective"
-    else:
-        rgba_corrected = rgba_out
-        method = "rembg_alpha_matting_no_quad"
-
-    # Step 4 — tight crop from alpha bounding box
-    alpha_c = np.array(rgba_corrected.split()[3])
-    coords  = np.argwhere(alpha_c > ALPHA_THRESHOLD)
-
-    if coords.size == 0:
-        # rembg removed everything — return original
-        white = Image.new("RGB", rgba_out.size, (255, 255, 255))
-        white.paste(rgba_out, mask=rgba_out.split()[3])
-        return cv2.cvtColor(np.array(white), cv2.COLOR_RGB2BGR), "fallback_original"
-
-    y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0)
-    h, w   = alpha_c.shape
-    y0 = max(y0 - TIGHT_CROP_PADDING_PX, 0)
-    x0 = max(x0 - TIGHT_CROP_PADDING_PX, 0)
-    y1 = min(y1 + TIGHT_CROP_PADDING_PX, h - 1)
-    x1 = min(x1 + TIGHT_CROP_PADDING_PX, w - 1)
-
-    rgba_cropped = rgba_corrected.crop((x0, y0, x1 + 1, y1 + 1))
-
-    # Flatten onto white
-    white = Image.new("RGB", rgba_cropped.size, (255, 255, 255))
-    white.paste(rgba_cropped, mask=rgba_cropped.split()[3])
-
-    return cv2.cvtColor(np.array(white), cv2.COLOR_RGB2BGR), method
+def is_plausible_aspect(image: np.ndarray, target_aspect: float) -> bool:
+    h, w = image.shape[:2]
+    if h < 1:
+        return False
+    aspect = w / h
+    return (
+        abs(aspect - target_aspect)         <= ASPECT_TOLERANCE or
+        abs((1.0 / aspect) - target_aspect) <= ASPECT_TOLERANCE
+    )
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
@@ -342,10 +239,7 @@ def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
     return image_bgr
 
 def force_passport_orientation(image_bgr: np.ndarray) -> np.ndarray:
-    """
-    Passport spreads must appear portrait (taller than wide) with text
-    reading left-to-right. Always rotate 90° CCW from landscape.
-    """
+    """Always produce portrait (taller than wide) with CCW rotation."""
     h, w = image_bgr.shape[:2]
     if h > w:
         image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
@@ -374,7 +268,7 @@ def render_card_exact(
 
 def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
     """
-    Composite the card onto a white canvas with a soft Gaussian drop shadow,
+    Composite card on white canvas with Gaussian drop shadow,
     replicating the Word 'Centre Shadow Rectangle' style.
     """
     card_pil = bgr_to_pil(card_bgr)
@@ -427,13 +321,13 @@ def process_image(
 ) -> dict:
     """
     Pipeline:
-    1. EXIF-aware read           — correct phone photo orientation
-    2. rembg + alpha matting     — clean isolation, no halo
-    3. Quad detection from alpha — find card corners from clean mask
-    4. Perspective correction    — flatten any photo angle
-    5. Exact physical resize     — consistent size, correct mm at 300 DPI
-    6. Drop shadow composite     — scanned appearance
-    7. Save PNG at 300 DPI
+    1. EXIF-aware read        — correct phone photo orientation
+    2. Mindee Cropper API     — detect document quad corners (handles any background,
+                                holographic patches, reflections — trained on real IDs)
+    3. Perspective correction — four_point_transform using Mindee quad
+    4. Exact physical resize  — consistent size, correct mm at 300 DPI
+    5. Drop shadow            — scanned appearance
+    6. Save PNG at 300 DPI
     """
     image = read_image_exif_aware(input_path)
 
@@ -443,9 +337,24 @@ def process_image(
         else target_width_mm / target_height_mm
     )
 
-    card_bgr, method = isolate_and_correct(image, target_aspect)
-    card_exact       = render_card_exact(card_bgr, target_width_mm, target_height_mm, doc_type=doc_type)
-    final_pil        = add_drop_shadow(card_exact)
+    # ── Step 2: Mindee Cropper ─────────────────────────────────────────────
+    quad   = get_mindee_quad(input_path)
+    method = "fallback_no_correction"
+
+    if quad is not None:
+        corrected = four_point_transform(image, quad)
+        if is_plausible_aspect(corrected, target_aspect):
+            image  = corrected
+            method = "mindee_cropper_perspective_corrected"
+        else:
+            # Mindee found something but wrong aspect — use original
+            method = "mindee_cropper_aspect_mismatch"
+    else:
+        method = "mindee_unavailable_no_correction"
+
+    # ── Steps 4–6 ─────────────────────────────────────────────────────────
+    card_exact = render_card_exact(image, target_width_mm, target_height_mm, doc_type=doc_type)
+    final_pil  = add_drop_shadow(card_exact)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
     return {
@@ -648,7 +557,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-05-v6"
+VERSION = "2025-06-05-v7"
 
 @app.get("/version")
 def version():
