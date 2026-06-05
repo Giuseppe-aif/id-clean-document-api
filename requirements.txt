@@ -8,3 +8,4 @@ reportlab
 python-multipart
 requests
 rembg
+rembg[cpu]
