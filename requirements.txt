@@ -7,3 +7,4 @@ rembg
 onnxruntime
 python-docx
 reportlab
+python-multipart
