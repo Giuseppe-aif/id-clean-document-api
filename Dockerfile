@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
 
-# cache-bust 2025-06-05-v7
+# cache-bust 2025-06-05-v8
 ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py /app/main.py
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
