@@ -204,12 +204,22 @@ def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
         return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
     return image_bgr
 
-def force_portrait(image_bgr: np.ndarray) -> np.ndarray:
-    """Rotate to portrait (taller than wide) if needed — for passport spreads."""
+def force_passport_orientation(image_bgr: np.ndarray) -> np.ndarray:
+    """
+    Passport spreads are photographed in landscape (wider than tall) but must
+    appear portrait (taller than wide) in the output document, with text reading
+    left-to-right. We always rotate 90° CCW to achieve this.
+
+    If the photo was already portrait (e.g. EXIF already corrected it or the
+    user held the phone portrait), we rotate it to landscape first so the CCW
+    rotation always produces the same final orientation.
+    """
     h, w = image_bgr.shape[:2]
-    if w > h:
-        return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return image_bgr
+    # Ensure we start from landscape before rotating CCW to portrait
+    if h > w:
+        # Already portrait — rotate CW to landscape first
+        image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+    return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
 # ── Exact-size renderer ───────────────────────────────────────────────────────
@@ -226,7 +236,7 @@ def render_card_exact(
     Both front and back always produce identical pixel dimensions.
     """
     if doc_type == "passport":
-        card_bgr = force_portrait(card_bgr)
+        card_bgr = force_passport_orientation(card_bgr)
     else:
         card_bgr = force_landscape(card_bgr)
 
@@ -526,7 +536,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-05-v4"
+VERSION = "2025-06-05-v5"
 
 @app.get("/version")
 def version():
