@@ -7,10 +7,10 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# cache-bust 2025-06-08-v10
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# cache-bust 2025-06-08-v10
 ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py?v=10 /app/main.py
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
