@@ -26,50 +26,42 @@ app = FastAPI()
 
 API_KEY = os.getenv("API_KEY", "")
 
-# ── Physical document dimensions (true card size, used for aspect ratio only) ─
-
-ID_CARD_WIDTH_MM  = 85.60
-ID_CARD_HEIGHT_MM = 53.98
-ID_CARD_ASPECT    = ID_CARD_WIDTH_MM / ID_CARD_HEIGHT_MM  # 1.5857
-
-PASSPORT_SCAN_WIDTH_MM  = 176.0
-PASSPORT_SCAN_HEIGHT_MM = 125.0
-PASSPORT_ASPECT         = PASSPORT_SCAN_WIDTH_MM / PASSPORT_SCAN_HEIGHT_MM
-
-# ── Layout: sizes on the A4 page (measured from reference PDFs) ───────────────
-# These match the Word "Centre Shadow Rectangle" output you provided.
-
-# ID card: rendered at ~107×74mm including shadow padding
-ID_RENDER_WIDTH_MM  = 107.0
-ID_RENDER_HEIGHT_MM = 74.0
-
-# Positions on A4 page (top-left of image including shadow)
-ID_FRONT_X_MM = 17.0
-ID_FRONT_Y_MM = 15.0   # from top of page
-ID_BACK_Y_MM  = 93.0   # front bottom + gap
-
-# Passport: rendered at ~114×160mm including shadow padding
-PASSPORT_RENDER_WIDTH_MM  = 114.0
-PASSPORT_RENDER_HEIGHT_MM = 160.0
-PASSPORT_X_MM = 6.0
-PASSPORT_Y_MM = 13.0
+# ── DPI ───────────────────────────────────────────────────────────────────────
 
 DPI = 300
 
-# ── Shadow settings (replicates Word Centre Shadow Rectangle) ─────────────────
+# ── Layout constants (measured from reference PDFs) ───────────────────────────
+
+# ID card render size on page (includes shadow padding)
+ID_RENDER_WIDTH_MM  = 107.0
+ID_RENDER_HEIGHT_MM =  74.0
+
+# ID card positions on A4 page
+ID_FRONT_X_MM =  17.0
+ID_FRONT_Y_MM =  15.0
+ID_BACK_Y_MM  =  93.0
+
+# Passport render size on page
+PASSPORT_RENDER_WIDTH_MM  = 114.0
+PASSPORT_RENDER_HEIGHT_MM = 160.0
+
+# Passport position on A4 page
+PASSPORT_X_MM =  6.0
+PASSPORT_Y_MM = 13.0
+
+# ── Shadow (replicates Word Centre Shadow Rectangle) ──────────────────────────
 
 SHADOW_OFFSET_MM = 2.5
 SHADOW_BLUR_MM   = 3.5
-SHADOW_OPACITY   = 140
-SHADOW_COLOR     = (100, 100, 100)
+SHADOW_OPACITY   = 150
+SHADOW_COLOR     = (90, 90, 90)
 
-# ── Dark edge trim ────────────────────────────────────────────────────────────
-# After perspective correction, trim this many pixels from each edge
-# to remove any residual dark background from the photo.
-EDGE_TRIM_PX = 8
+# ── Passport physical aspect (landscape scan: 176 × 125 mm) ──────────────────
+
+PASSPORT_SCAN_ASPECT = 176.0 / 125.0
 
 
-# ── Health endpoints ──────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def home():
@@ -80,7 +72,7 @@ def health():
     return {"status": "healthy"}
 
 
-# ── General utilities ─────────────────────────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def safe_file_part(value: str) -> str:
     value = str(value or "").strip()
@@ -95,51 +87,46 @@ def mm_to_pt(mm_value: float) -> float:
     return mm_value / 25.4 * 72.0
 
 
-# ── EXIF-aware image reading ──────────────────────────────────────────────────
+# ── EXIF-aware image read → RGB ndarray ──────────────────────────────────────
 
-def read_image_exif_aware(path: Path) -> np.ndarray:
+def read_image_rgb(path: Path) -> np.ndarray:
+    """
+    Read image honouring EXIF orientation.
+    Returns an RGB uint8 ndarray — colours are correct throughout the pipeline.
+    """
     pil_img = Image.open(path)
     try:
         exif = pil_img._getexif()
         if exif:
-            orientation_key = next(
-                (k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None
-            )
-            if orientation_key and orientation_key in exif:
-                orientation = exif[orientation_key]
-                rotations = {3: 180, 6: -90, 8: 90}
-                if orientation in rotations:
-                    pil_img = pil_img.rotate(rotations[orientation], expand=True)
-                elif orientation in {2, 4, 5, 7}:
-                    pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
-                    if orientation in {5, 7}:
-                        pil_img = pil_img.rotate(90 if orientation == 5 else -90, expand=True)
+            key = next((k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None)
+            if key and key in exif:
+                orientation = exif[key]
+                if orientation == 3:
+                    pil_img = pil_img.rotate(180, expand=True)
+                elif orientation == 6:
+                    pil_img = pil_img.rotate(-90, expand=True)
+                elif orientation == 8:
+                    pil_img = pil_img.rotate(90, expand=True)
     except Exception:
         pass
-    pil_img = pil_img.convert("RGB")
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_BGR2RGB)
-
-def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-
-def rgb_to_pil(image_rgb: np.ndarray) -> Image.Image:
-    return Image.fromarray(image_rgb)
+    return np.array(pil_img.convert("RGB"))
 
 
-# ── Perspective correction ────────────────────────────────────────────────────
+# ── Corner parsing ────────────────────────────────────────────────────────────
 
 def parse_corners(corners_json: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Parse corners JSON from Claude Vision (via n8n form field).
+    Returns float32 (4,2) array [TL, TR, BR, BL] or None.
+    """
     if not corners_json:
         return None
     try:
-        data = json.loads(corners_json)
-        pts  = np.array([
-            data["top_left"],
-            data["top_right"],
-            data["bottom_right"],
-            data["bottom_left"],
+        d = json.loads(corners_json)
+        return np.array([
+            d["top_left"], d["top_right"],
+            d["bottom_right"], d["bottom_left"],
         ], dtype="float32")
-        return pts
     except Exception:
         return None
 
@@ -147,10 +134,12 @@ def parse_rotation(corners_json: Optional[str]) -> int:
     if not corners_json:
         return 0
     try:
-        data = json.loads(corners_json)
-        return int(data.get("rotation_needed", 0))
+        return int(json.loads(corners_json).get("rotation_needed", 0))
     except Exception:
         return 0
+
+
+# ── Perspective correction ────────────────────────────────────────────────────
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
@@ -162,121 +151,96 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+def four_point_transform(image_rgb: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Warp image to flat rectangle. Operates on RGB ndarray, returns RGB ndarray."""
     rect       = order_points(pts)
     tl, tr, br, bl = rect
     max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
     max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
     if max_width < 50 or max_height < 50:
-        return image
+        return image_rgb
     dst = np.array([
         [0, 0],
         [max_width - 1, 0],
         [max_width - 1, max_height - 1],
         [0, max_height - 1],
     ], dtype="float32")
-    matrix = cv2.getPerspectiveTransform(rect, dst)
+    M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(
-        image, matrix, (max_width, max_height),
+        image_rgb, M, (max_width, max_height),
+        flags=cv2.INTER_LANCZOS4,
         borderValue=(255, 255, 255),
     )
 
-def apply_rotation(image: np.ndarray, rotation_needed: int) -> np.ndarray:
-    if rotation_needed == 90:
-        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    elif rotation_needed in (-90, 270):
-        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    elif rotation_needed == 180:
-        return cv2.rotate(image, cv2.ROTATE_180)
-    return image
+def apply_rotation(image_rgb: np.ndarray, degrees: int) -> np.ndarray:
+    if degrees == 90:
+        return cv2.rotate(image_rgb, cv2.ROTATE_90_CLOCKWISE)
+    elif degrees in (-90, 270):
+        return cv2.rotate(image_rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif degrees == 180:
+        return cv2.rotate(image_rgb, cv2.ROTATE_180)
+    return image_rgb
 
-def trim_dark_edges(image: np.ndarray, trim_px: int = EDGE_TRIM_PX) -> np.ndarray:
-    """
-    Trim a fixed number of pixels from all edges after perspective correction.
-    This removes any residual dark background that bleeds in from the photo edges.
-    """
-    h, w = image.shape[:2]
-    t = trim_px
-    if 2 * t >= h or 2 * t >= w:
-        return image
-    return image[t:h-t, t:w-t]
-
-
-# ── Orientation helpers ───────────────────────────────────────────────────────
-
-def force_landscape(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
+def force_landscape(image_rgb: np.ndarray) -> np.ndarray:
+    h, w = image_rgb.shape[:2]
     if h > w:
-        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    return image
+        return cv2.rotate(image_rgb, cv2.ROTATE_90_CLOCKWISE)
+    return image_rgb
 
-def force_passport_orientation(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
+def force_passport_orientation(image_rgb: np.ndarray) -> np.ndarray:
+    """Normalise passport to portrait (taller than wide), text reading L→R."""
+    h, w = image_rgb.shape[:2]
     if h > w:
-        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        image_rgb = cv2.rotate(image_rgb, cv2.ROTATE_90_CLOCKWISE)
+    return cv2.rotate(image_rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
-# ── Card renderer ─────────────────────────────────────────────────────────────
+# ── Card renderer with shadow ─────────────────────────────────────────────────
 
-def render_card(
+def render_card_with_shadow(
     card_rgb: np.ndarray,
-    target_aspect: float,
-    doc_type: str = "id",
+    render_w_mm: float,
+    render_h_mm: float,
 ) -> Image.Image:
     """
-    Render the card as a PIL RGB image with drop shadow.
-    The card is scaled to fit inside the target render dimensions
-    while preserving aspect ratio. White padding fills any gap.
-    Shadow replicates Word Centre Shadow Rectangle style.
+    Fit card_rgb inside a canvas of (render_w_mm × render_h_mm) at DPI,
+    preserving aspect ratio, centred, with a Gaussian drop shadow that
+    replicates the Word Centre Shadow Rectangle style.
+    Returns a PIL RGB image ready to save as PNG.
     """
-    # Normalise orientation
-    if doc_type == "passport":
-        card_rgb = force_passport_orientation(card_rgb)
-    else:
-        card_rgb = force_landscape(card_rgb)
-
-    # Determine target pixel dimensions from layout constants
-    if doc_type == "passport":
-        render_w_mm = PASSPORT_RENDER_WIDTH_MM
-        render_h_mm = PASSPORT_RENDER_HEIGHT_MM
-    else:
-        render_w_mm = ID_RENDER_WIDTH_MM
-        render_h_mm = ID_RENDER_HEIGHT_MM
-
     shadow_offset_px = mm_to_px(SHADOW_OFFSET_MM)
     shadow_blur_px   = mm_to_px(SHADOW_BLUR_MM)
     shadow_pad       = shadow_blur_px * 2 + shadow_offset_px
 
-    # Card area inside the render box (subtract shadow padding)
-    card_area_w_px = mm_to_px(render_w_mm) - shadow_pad
-    card_area_h_px = mm_to_px(render_h_mm) - shadow_pad
+    # Available card area (canvas minus shadow padding)
+    card_area_w = mm_to_px(render_w_mm) - shadow_pad
+    card_area_h = mm_to_px(render_h_mm) - shadow_pad
 
-    # Scale card to fit inside card area, preserve aspect ratio
-    h, w = card_rgb.shape[:2]
-    scale = min(card_area_w_px / w, card_area_h_px / h)
+    # Scale to fit, preserving aspect ratio
+    h, w  = card_rgb.shape[:2]
+    scale = min(card_area_w / w, card_area_h / h)
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
 
-    resized = cv2.resize(card_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    card_pil = rgb_to_pil(resized)
+    resized  = cv2.resize(card_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    card_pil = Image.fromarray(resized)   # RGB ndarray → PIL RGB (correct colours)
 
-    # Total canvas size
-    canvas_w = card_area_w_px + shadow_pad
-    canvas_h = card_area_h_px + shadow_pad
+    # Canvas dimensions
+    canvas_w = card_area_w + shadow_pad
+    canvas_h = card_area_h + shadow_pad
 
-    # Card position (top-left of card area, centred within card_area)
-    card_x = (card_area_w_px - new_w) // 2
-    card_y = (card_area_h_px - new_h) // 2
+    # Card top-left (centred inside card area)
+    card_x = (card_area_w - new_w) // 2
+    card_y = (card_area_h - new_h) // 2
 
-    # Shadow position (offset from card)
+    # Shadow top-left (offset from card)
     shadow_x = card_x + shadow_offset_px
     shadow_y = card_y + shadow_offset_px
 
-    # White base canvas
+    # White base
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
-    # Shadow layer
+    # Shadow layer: solid rect → Gaussian blur
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
     shadow_rect  = Image.new(
         "RGBA", (new_w, new_h),
@@ -292,9 +256,9 @@ def render_card(
     return base.convert("RGB")
 
 
-# ── PIL → ReportLab ImageReader ───────────────────────────────────────────────
+# ── PIL → ReportLab reader ────────────────────────────────────────────────────
 
-def pil_to_image_reader(pil_img: Image.Image) -> ImageReader:
+def pil_to_reader(pil_img: Image.Image) -> ImageReader:
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG", dpi=(DPI, DPI))
     buf.seek(0)
@@ -310,35 +274,41 @@ def process_image(
     corners_json: Optional[str] = None,
 ) -> dict:
     """
-    1. EXIF-aware read
-    2. Perspective correction using Claude Vision corners
-    3. Rotation correction
-    4. Dark edge trim (removes residual background)
-    5. Render with shadow at layout dimensions
+    1. Read image as RGB (EXIF-aware)
+    2. Perspective-correct using Claude Vision corners
+    3. Apply rotation if needed
+    4. Normalise orientation
+    5. Render with drop shadow at target layout size
     6. Save PNG at 300 DPI
     """
-    image = read_image_exif_aware(input_path)
+    img = read_image_rgb(input_path)
 
+    # Perspective correction
     pts = parse_corners(corners_json)
     if pts is not None:
-        image  = four_point_transform(image, pts)
-        method = "claude_corners_perspective_corrected"
+        img    = four_point_transform(img, pts)
+        method = "claude_corners_corrected"
     else:
         method = "no_corners_fallback"
 
-    rotation = parse_rotation(corners_json)
-    if rotation != 0:
-        image  = apply_rotation(image, rotation)
-        method += f"_rotated_{rotation}"
+    # Rotation
+    rot = parse_rotation(corners_json)
+    if rot != 0:
+        img    = apply_rotation(img, rot)
+        method += f"_rot{rot}"
 
-    # Trim dark edges after perspective correction
-    image = trim_dark_edges(image, trim_px=EDGE_TRIM_PX)
+    # Orientation normalisation
+    if doc_type == "passport":
+        img         = force_passport_orientation(img)
+        render_w_mm = PASSPORT_RENDER_WIDTH_MM
+        render_h_mm = PASSPORT_RENDER_HEIGHT_MM
+    else:
+        img         = force_landscape(img)
+        render_w_mm = ID_RENDER_WIDTH_MM
+        render_h_mm = ID_RENDER_HEIGHT_MM
 
-    target_aspect = (
-        PASSPORT_ASPECT if doc_type == "passport" else ID_CARD_ASPECT
-    )
-
-    final_pil = render_card(image, target_aspect, doc_type=doc_type)
+    # Render with shadow
+    final_pil = render_card_with_shadow(img, render_w_mm, render_h_mm)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
     return {
@@ -348,22 +318,7 @@ def process_image(
     }
 
 
-# ── DOCX helpers ──────────────────────────────────────────────────────────────
-
-def add_image_at_position(
-    doc: Document,
-    image_path: Path,
-    width_cm: float,
-):
-    """Add image paragraph left-aligned with standard indent."""
-    paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    paragraph.paragraph_format.space_before = Pt(0)
-    paragraph.paragraph_format.space_after  = Pt(0)
-    run = paragraph.add_run()
-    run.add_picture(str(image_path), width=Cm(width_cm))
-    return paragraph
-
+# ── DOCX ──────────────────────────────────────────────────────────────────────
 
 def create_docx(
     docx_path: Path,
@@ -373,8 +328,6 @@ def create_docx(
 ):
     doc     = Document()
     section = doc.sections[0]
-
-    # A4 page with margins matching reference layout
     section.page_width    = Cm(21.0)
     section.page_height   = Cm(29.7)
     section.top_margin    = Cm(1.5)
@@ -382,21 +335,26 @@ def create_docx(
     section.left_margin   = Cm(1.5)
     section.right_margin  = Cm(1.5)
 
+    def add_img(path, w_mm):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after  = Pt(0)
+        p.add_run().add_picture(str(path), width=Cm(w_mm / 10.0))
+
     if doc_type == "id":
-        w_cm = ID_RENDER_WIDTH_MM / 10.0
-        add_image_at_position(doc, front_image, w_cm)
+        add_img(front_image, ID_RENDER_WIDTH_MM)
         doc.add_paragraph("")
-        add_image_at_position(doc, back_image, w_cm)
+        add_img(back_image,  ID_RENDER_WIDTH_MM)
     elif doc_type == "passport":
-        w_cm = PASSPORT_RENDER_WIDTH_MM / 10.0
-        add_image_at_position(doc, front_image, w_cm)
+        add_img(front_image, PASSPORT_RENDER_WIDTH_MM)
     else:
-        raise ValueError(f"Unsupported document type: {doc_type}")
+        raise ValueError(f"Unsupported doc_type: {doc_type}")
 
     doc.save(docx_path)
 
 
-# ── PDF helpers ───────────────────────────────────────────────────────────────
+# ── PDF ───────────────────────────────────────────────────────────────────────
 
 def create_pdf(
     pdf_path: Path,
@@ -404,24 +362,17 @@ def create_pdf(
     front_image: Path,
     back_image: Optional[Path],
 ):
-    """
-    Place card images on A4 at exact positions measured from reference PDFs.
-    """
-    page_w, page_h = A4   # 595.3 x 841.9 pt
+    page_w, page_h = A4
     c = rl_canvas.Canvas(str(pdf_path), pagesize=A4)
 
-    def draw(img_path: Path, x_mm: float, y_mm: float, w_mm: float):
+    def draw(img_path, x_mm, y_mm, w_mm):
         pil_img = Image.open(img_path)
-        # Actual image height in mm at DPI
-        h_mm = pil_img.height / (DPI / 25.4)
-        # ReportLab y=0 is bottom of page
-        y_pt = page_h - mm_to_pt(y_mm) - mm_to_pt(h_mm)
-        reader = pil_to_image_reader(pil_img)
+        h_mm    = pil_img.height / (DPI / 25.4)
+        y_pt    = page_h - mm_to_pt(y_mm) - mm_to_pt(h_mm)
         c.drawImage(
-            reader,
+            pil_to_reader(pil_img),
             mm_to_pt(x_mm), y_pt,
-            width=mm_to_pt(w_mm),
-            height=mm_to_pt(h_mm),
+            width=mm_to_pt(w_mm), height=mm_to_pt(h_mm),
             mask="auto",
         )
 
@@ -432,13 +383,13 @@ def create_pdf(
     elif doc_type == "passport":
         draw(front_image, PASSPORT_X_MM, PASSPORT_Y_MM, PASSPORT_RENDER_WIDTH_MM)
     else:
-        raise ValueError(f"Unsupported document type: {doc_type}")
+        raise ValueError(f"Unsupported doc_type: {doc_type}")
 
     c.showPage()
     c.save()
 
 
-# ── Upload / base64 utils ─────────────────────────────────────────────────────
+# ── Upload / base64 ───────────────────────────────────────────────────────────
 
 async def save_upload(upload_file: UploadFile, destination: Path):
     destination.write_bytes(await upload_file.read())
@@ -486,32 +437,20 @@ async def process_document(
         if doc_type == "id":
             front_processed = tmp / "front_processed.png"
             back_processed  = tmp / "back_processed.png"
-            processed_info.append(
-                process_image(front_input, front_processed, doc_type="id", corners_json=front_corners)
-            )
-            processed_info.append(
-                process_image(back_input, back_processed, doc_type="id", corners_json=back_corners)
-            )
+            processed_info.append(process_image(front_input, front_processed, "id", front_corners))
+            processed_info.append(process_image(back_input,  back_processed,  "id", back_corners))
         else:
             front_processed = tmp / "passport_processed.png"
             back_processed  = None
-            processed_info.append(
-                process_image(front_input, front_processed, doc_type="passport", corners_json=front_corners)
-            )
+            processed_info.append(process_image(front_input, front_processed, "passport", front_corners))
 
         docx_filename = f"{output_base_name}.docx"
         pdf_filename  = f"{output_base_name}.pdf"
         docx_path     = tmp / docx_filename
         pdf_path      = tmp / pdf_filename
 
-        create_docx(
-            docx_path=docx_path, doc_type=doc_type,
-            front_image=front_processed, back_image=back_processed,
-        )
-        create_pdf(
-            pdf_path=pdf_path, doc_type=doc_type,
-            front_image=front_processed, back_image=back_processed,
-        )
+        create_docx(docx_path, doc_type, front_processed, back_processed)
+        create_pdf(pdf_path,  doc_type, front_processed, back_processed)
 
         return {
             "status":           "success",
@@ -557,7 +496,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-08-v13"
+VERSION = "2025-06-08-v14"
 
 @app.get("/version")
 def version():
