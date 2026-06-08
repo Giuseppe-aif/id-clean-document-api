@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import io
+import json
 
 import cv2
 import numpy as np
@@ -56,13 +57,13 @@ SHADOW_BLUR_MM   = 3.0
 SHADOW_OPACITY   = 160
 SHADOW_COLOR     = (80, 80, 80)
 
-# ── rembg / isolation tunables ────────────────────────────────────────────────
+# ── rembg tunables ────────────────────────────────────────────────────────────
 
 ALPHA_THRESHOLD       = 10
-TIGHT_CROP_PADDING_PX = 6
+TIGHT_CROP_PADDING_PX = 4
 
 
-# ── rembg session (loaded once at startup) ────────────────────────────────────
+# ── rembg session ─────────────────────────────────────────────────────────────
 
 _REMBG_SESSION = None
 
@@ -100,8 +101,7 @@ def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
 
 def read_image_exif_aware(path: Path) -> np.ndarray:
     """
-    Read image respecting EXIF orientation so phone photos arrive correctly
-    oriented before any processing begins.
+    Read image respecting EXIF orientation.
     Returns BGR ndarray (OpenCV convention).
     """
     pil_img = Image.open(path)
@@ -130,31 +130,99 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 
-# ── rembg isolation + hard rectangular clip ───────────────────────────────────
-#
-# Strategy:
-#   1. rembg (ISNet) removes background — handles any background colour.
-#   2. Find bounding box of non-transparent pixels → hard rectangular clip.
-#      This gives sharp 90° corners instead of rembg's soft edges.
-#   3. Return RGBA with transparent background (not white).
-#      Word and PDF both render on white pages so transparency = white in
-#      practice, but avoids the visible white-box halo artifact.
+# ── Perspective correction using Claude corners ───────────────────────────────
 
-def isolate_card_transparent(image_bgr: np.ndarray) -> Image.Image:
+def parse_corners(corners_json: Optional[str]) -> Optional[np.ndarray]:
     """
-    Use rembg to isolate the card, then clip to a hard axis-aligned rectangle.
-    Returns a PIL RGBA image — card pixels intact, background fully transparent.
-    Sharp 90° corners guaranteed by the bounding box geometry.
+    Parse corner coordinates sent from n8n (Claude Vision output).
+    Expects JSON: {"top_left": [x,y], "top_right": [x,y],
+                   "bottom_right": [x,y], "bottom_left": [x,y],
+                   "rotation_needed": 0}
+    Returns float32 (4,2) array or None.
+    """
+    if not corners_json:
+        return None
+    try:
+        data = json.loads(corners_json)
+        pts = np.array([
+            data["top_left"],
+            data["top_right"],
+            data["bottom_right"],
+            data["bottom_left"],
+        ], dtype="float32")
+        return pts
+    except Exception:
+        return None
+
+def parse_rotation(corners_json: Optional[str]) -> int:
+    """Extract rotation_needed from corners JSON. Returns 0 if missing."""
+    if not corners_json:
+        return 0
+    try:
+        data = json.loads(corners_json)
+        return int(data.get("rotation_needed", 0))
+    except Exception:
+        return 0
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4, 2), dtype="float32")
+    s    = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff    = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Warp image to flat rectangle using 4 corner points."""
+    rect       = order_points(pts)
+    tl, tr, br, bl = rect
+    max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if max_width < 50 or max_height < 50:
+        return image
+    dst = np.array([
+        [0,             0             ],
+        [max_width - 1, 0             ],
+        [max_width - 1, max_height - 1],
+        [0,             max_height - 1],
+    ], dtype="float32")
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(
+        image, matrix, (max_width, max_height),
+        borderValue=(255, 255, 255),
+    )
+
+def apply_rotation(image: np.ndarray, rotation_needed: int) -> np.ndarray:
+    """Apply clockwise rotation as specified by Claude."""
+    if rotation_needed == 90:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation_needed == -90 or rotation_needed == 270:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation_needed == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    return image
+
+
+# ── Background removal ────────────────────────────────────────────────────────
+
+def remove_background(image_bgr: np.ndarray) -> Image.Image:
+    """
+    Use rembg (ISNet) to remove background after perspective correction.
+    At this point the card is already a clean rectangle so rembg only
+    needs to separate card from any residual border — much easier task.
+    Returns RGBA PIL image.
     """
     pil_rgb  = bgr_to_pil(image_bgr)
     rgba_out = remove(pil_rgb, session=get_rembg_session())
 
-    # Find bounding box of non-transparent pixels
+    # Hard rectangular clip from alpha bounding box — sharp corners
     alpha  = np.array(rgba_out.split()[3])
     coords = np.argwhere(alpha > ALPHA_THRESHOLD)
 
     if coords.size == 0:
-        return rgba_out   # rembg removed everything — return as-is
+        return rgba_out
 
     y0, x0 = coords.min(axis=0)
     y1, x1 = coords.max(axis=0)
@@ -165,19 +233,14 @@ def isolate_card_transparent(image_bgr: np.ndarray) -> Image.Image:
     y1 = min(y1 + TIGHT_CROP_PADDING_PX, h - 1)
     x1 = min(x1 + TIGHT_CROP_PADDING_PX, w - 1)
 
-    # Hard rectangular crop — this is what gives sharp corners.
-    # The soft alpha within this rectangle is flattened to fully opaque
-    # so the card edge is a clean hard line, not a feathered rembg edge.
     rgba_cropped = rgba_out.crop((x0, y0, x1 + 1, y1 + 1))
 
-    # Binarise the alpha: anything above threshold → fully opaque (255)
-    # This removes any soft/feathered edge rembg left and gives a hard rect.
+    # Binarise alpha — hard edges, no feathering
     r, g, b, a = rgba_cropped.split()
     a_arr = np.array(a)
     a_arr[a_arr > ALPHA_THRESHOLD] = 255
     a_arr[a_arr <= ALPHA_THRESHOLD] = 0
-    a_hard = Image.fromarray(a_arr)
-    rgba_hard = Image.merge("RGBA", (r, g, b, a_hard))
+    rgba_hard = Image.merge("RGBA", (r, g, b, Image.fromarray(a_arr)))
 
     return rgba_hard
 
@@ -185,18 +248,16 @@ def isolate_card_transparent(image_bgr: np.ndarray) -> Image.Image:
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
 def force_landscape(rgba: Image.Image) -> Image.Image:
-    """Rotate to landscape (wider than tall) if needed — for ID cards."""
     w, h = rgba.size
     if h > w:
         return rgba.rotate(-90, expand=True)
     return rgba
 
 def force_passport_orientation(rgba: Image.Image) -> Image.Image:
-    """Always rotate 90° CCW to produce correct portrait passport output."""
     w, h = rgba.size
     if h > w:
-        rgba = rgba.rotate(90, expand=True)   # normalise to landscape first
-    return rgba.rotate(90, expand=True)        # then CCW to portrait
+        rgba = rgba.rotate(90, expand=True)
+    return rgba.rotate(90, expand=True)
 
 
 # ── Exact-size renderer ───────────────────────────────────────────────────────
@@ -207,11 +268,6 @@ def render_card_exact(
     target_height_mm: float,
     doc_type: str = "id",
 ) -> Image.Image:
-    """
-    Resize the isolated card RGBA to exact physical pixel dimensions.
-    Orientation is normalised first.
-    Both front and back always produce identical pixel dimensions.
-    """
     if doc_type == "passport":
         rgba = force_passport_orientation(rgba)
     else:
@@ -226,12 +282,8 @@ def render_card_exact(
 
 def add_drop_shadow(card_rgba: Image.Image) -> Image.Image:
     """
-    Composite the RGBA card onto a white canvas with a soft Gaussian drop
-    shadow, replicating the Word 'Centre Shadow Rectangle' style.
-
-    Using the RGBA card (transparent background) means the shadow is cast
-    only by the card pixels — no white-box halo visible.
-    Returns a PIL RGB image ready to save as PNG.
+    Composite RGBA card onto white canvas with Gaussian drop shadow.
+    Shadow follows the card's alpha so no white-box halo is visible.
     """
     cw, ch = card_rgba.size
 
@@ -246,23 +298,16 @@ def add_drop_shadow(card_rgba: Image.Image) -> Image.Image:
     shadow_x = card_x + shadow_offset_px
     shadow_y = card_y + shadow_offset_px
 
-    # White base
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
-    # Shadow: use card's alpha channel as shadow shape → blur it
-    # This makes the shadow follow the exact card outline
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
-    shadow_card  = Image.new(
-        "RGBA", (cw, ch),
-        (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], 0),
-    )
-    # Fill shadow using the card's own alpha as a mask
+    shadow_card  = Image.new("RGBA", (cw, ch),
+                             (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], 0))
     shadow_alpha = card_rgba.split()[3].point(lambda x: int(x * SHADOW_OPACITY / 255))
     shadow_card.putalpha(shadow_alpha)
     shadow_layer.paste(shadow_card, (shadow_x, shadow_y))
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_px))
 
-    # Composite: base → shadow → card (card uses its own alpha)
     base = Image.alpha_composite(base, shadow_layer)
     base.paste(card_rgba, (card_x, card_y), mask=card_rgba.split()[3])
 
@@ -286,26 +331,42 @@ def process_image(
     target_width_mm: float,
     target_height_mm: float,
     doc_type: str = "id",
+    corners_json: Optional[str] = None,
 ) -> dict:
     """
     Pipeline:
-    1. EXIF-aware read        — correct phone photo orientation
-    2. rembg isolation        — remove any background (ISNet model)
-    3. Hard rectangular clip  — sharp 90° corners, transparent background
-    4. Exact physical resize  — consistent size, correct mm at 300 DPI
-    5. Drop shadow composite  — shadow follows card alpha, no white halo
-    6. Save PNG at 300 DPI
+    1. EXIF-aware read
+    2. Perspective correction using Claude's corner coordinates
+    3. Rotation correction using Claude's rotation_needed value
+    4. rembg background removal (easier task post-correction)
+    5. Hard rectangular clip — sharp corners, transparent background
+    6. Exact physical resize
+    7. Drop shadow composite
+    8. Save PNG at 300 DPI
     """
     image = read_image_exif_aware(input_path)
 
-    # Step 2–3: isolate, hard rect, transparent bg
-    card_rgba = isolate_card_transparent(image)
-    method    = "rembg_hard_rect_transparent"
+    # Step 2: perspective correction from Claude corners
+    pts = parse_corners(corners_json)
+    if pts is not None:
+        image  = four_point_transform(image, pts)
+        method = "claude_corners_perspective_corrected"
+    else:
+        method = "no_corners_fallback"
 
-    # Step 4: exact physical size + orientation
+    # Step 3: rotation correction
+    rotation = parse_rotation(corners_json)
+    if rotation != 0:
+        image  = apply_rotation(image, rotation)
+        method += f"_rotated_{rotation}"
+
+    # Step 4-5: background removal + hard clip
+    card_rgba = remove_background(image)
+
+    # Step 6: exact physical size + orientation
     card_exact = render_card_exact(card_rgba, target_width_mm, target_height_mm, doc_type=doc_type)
 
-    # Step 5–6: shadow + save
+    # Step 7-8: shadow + save
     final_pil = add_drop_shadow(card_exact)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
@@ -415,6 +476,8 @@ async def process_document(
     output_base_name: str                  = Form(...),
     front_image:      UploadFile           = File(...),
     back_image:       Optional[UploadFile] = File(None),
+    front_corners:    Optional[str]        = Form(None),
+    back_corners:     Optional[str]        = Form(None),
     x_api_key:        Optional[str]        = Header(None),
 ):
     if API_KEY and x_api_key != API_KEY:
@@ -443,16 +506,31 @@ async def process_document(
             front_processed = tmp / "front_processed.png"
             back_processed  = tmp / "back_processed.png"
             processed_info.append(
-                process_image(front_input, front_processed, ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM, doc_type="id")
+                process_image(
+                    front_input, front_processed,
+                    ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM,
+                    doc_type="id",
+                    corners_json=front_corners,
+                )
             )
             processed_info.append(
-                process_image(back_input, back_processed, ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM, doc_type="id")
+                process_image(
+                    back_input, back_processed,
+                    ID_CARD_WIDTH_MM, ID_CARD_HEIGHT_MM,
+                    doc_type="id",
+                    corners_json=back_corners,
+                )
             )
         else:
             front_processed = tmp / "passport_processed.png"
             back_processed  = None
             processed_info.append(
-                process_image(front_input, front_processed, PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM, doc_type="passport")
+                process_image(
+                    front_input, front_processed,
+                    PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM,
+                    doc_type="passport",
+                    corners_json=front_corners,
+                )
             )
 
         docx_filename = f"{output_base_name}.docx"
@@ -491,6 +569,8 @@ async def process_document_test(
     output_base_name: str                  = Form(...),
     front_image:      UploadFile           = File(...),
     back_image:       Optional[UploadFile] = File(None),
+    front_corners:    Optional[str]        = Form(None),
+    back_corners:     Optional[str]        = Form(None),
     x_api_key:        Optional[str]        = Header(None),
 ):
     if API_KEY and x_api_key != API_KEY:
@@ -506,10 +586,12 @@ async def process_document_test(
         "output_base_name": output_base_name,
         "front_filename":   front_image.filename,
         "back_filename":    back_image.filename if back_image else None,
+        "front_corners":    front_corners,
+        "back_corners":     back_corners,
     }
 
 
-VERSION = "2025-06-05-v8"
+VERSION = "2025-06-08-v9"
 
 @app.get("/version")
 def version():
