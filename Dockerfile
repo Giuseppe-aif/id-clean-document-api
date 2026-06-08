@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# cache-bust 2025-06-08-v13
-ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py?v=13 /app/main.py
+# cache-bust 2025-06-08-v14
+ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py?v=14 /app/main.py
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
