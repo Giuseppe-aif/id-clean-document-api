@@ -11,7 +11,6 @@ import json
 import cv2
 import numpy as np
 from PIL import Image, ImageFilter, ExifTags
-from rembg import remove, new_session
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -57,22 +56,6 @@ SHADOW_BLUR_MM   = 3.0
 SHADOW_OPACITY   = 160
 SHADOW_COLOR     = (80, 80, 80)
 
-# ── rembg tunables ────────────────────────────────────────────────────────────
-
-ALPHA_THRESHOLD       = 10
-TIGHT_CROP_PADDING_PX = 4
-
-
-# ── rembg session ─────────────────────────────────────────────────────────────
-
-_REMBG_SESSION = None
-
-def get_rembg_session():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None:
-        _REMBG_SESSION = new_session("isnet-general-use")
-    return _REMBG_SESSION
-
 
 # ── Health endpoints ──────────────────────────────────────────────────────────
 
@@ -101,7 +84,8 @@ def mm_to_px(mm_value: float, dpi: int = DPI) -> int:
 
 def read_image_exif_aware(path: Path) -> np.ndarray:
     """
-    Read image respecting EXIF orientation.
+    Read image respecting EXIF orientation so phone photos arrive correctly
+    oriented before any processing begins.
     Returns BGR ndarray (OpenCV convention).
     """
     pil_img = Image.open(path)
@@ -134,17 +118,18 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Image.Image:
 
 def parse_corners(corners_json: Optional[str]) -> Optional[np.ndarray]:
     """
-    Parse corner coordinates sent from n8n (Claude Vision output).
-    Expects JSON: {"top_left": [x,y], "top_right": [x,y],
-                   "bottom_right": [x,y], "bottom_left": [x,y],
-                   "rotation_needed": 0}
-    Returns float32 (4,2) array or None.
+    Parse corner coordinates from Claude Vision (sent via n8n form field).
+    Expected JSON format:
+      {"top_left": [x,y], "top_right": [x,y],
+       "bottom_right": [x,y], "bottom_left": [x,y],
+       "rotation_needed": 0}
+    Returns float32 (4,2) array or None if parsing fails.
     """
     if not corners_json:
         return None
     try:
         data = json.loads(corners_json)
-        pts = np.array([
+        pts  = np.array([
             data["top_left"],
             data["top_right"],
             data["bottom_right"],
@@ -155,7 +140,7 @@ def parse_corners(corners_json: Optional[str]) -> Optional[np.ndarray]:
         return None
 
 def parse_rotation(corners_json: Optional[str]) -> int:
-    """Extract rotation_needed from corners JSON. Returns 0 if missing."""
+    """Extract rotation_needed degrees from corners JSON. Returns 0 if absent."""
     if not corners_json:
         return 0
     try:
@@ -165,6 +150,7 @@ def parse_rotation(corners_json: Optional[str]) -> int:
         return 0
 
 def order_points(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points: top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
     s    = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -175,7 +161,10 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Warp image to flat rectangle using 4 corner points."""
+    """
+    Warp the image to a flat rectangle using 4 corner points.
+    The output contains exactly the card content — no background.
+    """
     rect       = order_points(pts)
     tl, tr, br, bl = rect
     max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
@@ -195,97 +184,66 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     )
 
 def apply_rotation(image: np.ndarray, rotation_needed: int) -> np.ndarray:
-    """Apply clockwise rotation as specified by Claude."""
+    """Apply clockwise rotation as specified by Claude Vision."""
     if rotation_needed == 90:
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    elif rotation_needed == -90 or rotation_needed == 270:
+    elif rotation_needed in (-90, 270):
         return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
     elif rotation_needed == 180:
         return cv2.rotate(image, cv2.ROTATE_180)
     return image
 
 
-# ── Background removal ────────────────────────────────────────────────────────
-
-def remove_background(image_bgr: np.ndarray) -> Image.Image:
-    """
-    Use rembg (ISNet) to remove background after perspective correction.
-    At this point the card is already a clean rectangle so rembg only
-    needs to separate card from any residual border — much easier task.
-    Returns RGBA PIL image.
-    """
-    pil_rgb  = bgr_to_pil(image_bgr)
-    rgba_out = remove(pil_rgb, session=get_rembg_session())
-
-    # Hard rectangular clip from alpha bounding box — sharp corners
-    alpha  = np.array(rgba_out.split()[3])
-    coords = np.argwhere(alpha > ALPHA_THRESHOLD)
-
-    if coords.size == 0:
-        return rgba_out
-
-    y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0)
-    h, w   = alpha.shape
-
-    y0 = max(y0 - TIGHT_CROP_PADDING_PX, 0)
-    x0 = max(x0 - TIGHT_CROP_PADDING_PX, 0)
-    y1 = min(y1 + TIGHT_CROP_PADDING_PX, h - 1)
-    x1 = min(x1 + TIGHT_CROP_PADDING_PX, w - 1)
-
-    rgba_cropped = rgba_out.crop((x0, y0, x1 + 1, y1 + 1))
-
-    # Binarise alpha — hard edges, no feathering
-    r, g, b, a = rgba_cropped.split()
-    a_arr = np.array(a)
-    a_arr[a_arr > ALPHA_THRESHOLD] = 255
-    a_arr[a_arr <= ALPHA_THRESHOLD] = 0
-    rgba_hard = Image.merge("RGBA", (r, g, b, Image.fromarray(a_arr)))
-
-    return rgba_hard
-
-
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
-def force_landscape(rgba: Image.Image) -> Image.Image:
-    w, h = rgba.size
+def force_landscape(image_bgr: np.ndarray) -> np.ndarray:
+    """Rotate to landscape (wider than tall) — for ID cards."""
+    h, w = image_bgr.shape[:2]
     if h > w:
-        return rgba.rotate(-90, expand=True)
-    return rgba
+        return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+    return image_bgr
 
-def force_passport_orientation(rgba: Image.Image) -> Image.Image:
-    w, h = rgba.size
+def force_passport_orientation(image_bgr: np.ndarray) -> np.ndarray:
+    """Always rotate 90° CCW to produce correct portrait passport output."""
+    h, w = image_bgr.shape[:2]
     if h > w:
-        rgba = rgba.rotate(90, expand=True)
-    return rgba.rotate(90, expand=True)
+        image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+    return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
 # ── Exact-size renderer ───────────────────────────────────────────────────────
 
 def render_card_exact(
-    rgba: Image.Image,
+    card_bgr: np.ndarray,
     target_width_mm: float,
     target_height_mm: float,
     doc_type: str = "id",
-) -> Image.Image:
+) -> np.ndarray:
+    """
+    Resize the perspective-corrected card to exact physical pixel dimensions.
+    Orientation is normalised first.
+    Both front and back always produce identical pixel dimensions.
+    """
     if doc_type == "passport":
-        rgba = force_passport_orientation(rgba)
+        card_bgr = force_passport_orientation(card_bgr)
     else:
-        rgba = force_landscape(rgba)
+        card_bgr = force_landscape(card_bgr)
 
     target_w_px = mm_to_px(target_width_mm)
     target_h_px = mm_to_px(target_height_mm)
-    return rgba.resize((target_w_px, target_h_px), Image.LANCZOS)
+    return cv2.resize(card_bgr, (target_w_px, target_h_px), interpolation=cv2.INTER_LANCZOS4)
 
 
 # ── Drop shadow compositor ────────────────────────────────────────────────────
 
-def add_drop_shadow(card_rgba: Image.Image) -> Image.Image:
+def add_drop_shadow(card_bgr: np.ndarray) -> Image.Image:
     """
-    Composite RGBA card onto white canvas with Gaussian drop shadow.
-    Shadow follows the card's alpha so no white-box halo is visible.
+    Composite the card on a white canvas with a soft Gaussian drop shadow,
+    replicating the Word 'Centre Shadow Rectangle' style.
+    Returns a PIL RGB image ready to save as PNG.
     """
-    cw, ch = card_rgba.size
+    card_pil = bgr_to_pil(card_bgr)
+    cw, ch   = card_pil.size
 
     shadow_offset_px = mm_to_px(SHADOW_OFFSET_MM)
     shadow_blur_px   = mm_to_px(SHADOW_BLUR_MM)
@@ -301,15 +259,15 @@ def add_drop_shadow(card_rgba: Image.Image) -> Image.Image:
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
-    shadow_card  = Image.new("RGBA", (cw, ch),
-                             (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], 0))
-    shadow_alpha = card_rgba.split()[3].point(lambda x: int(x * SHADOW_OPACITY / 255))
-    shadow_card.putalpha(shadow_alpha)
-    shadow_layer.paste(shadow_card, (shadow_x, shadow_y))
+    shadow_rect  = Image.new(
+        "RGBA", (cw, ch),
+        (SHADOW_COLOR[0], SHADOW_COLOR[1], SHADOW_COLOR[2], SHADOW_OPACITY),
+    )
+    shadow_layer.paste(shadow_rect, (shadow_x, shadow_y))
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_px))
 
     base = Image.alpha_composite(base, shadow_layer)
-    base.paste(card_rgba, (card_x, card_y), mask=card_rgba.split()[3])
+    base.paste(card_pil, (card_x, card_y))
 
     return base.convert("RGB")
 
@@ -335,14 +293,17 @@ def process_image(
 ) -> dict:
     """
     Pipeline:
-    1. EXIF-aware read
-    2. Perspective correction using Claude's corner coordinates
-    3. Rotation correction using Claude's rotation_needed value
-    4. rembg background removal (easier task post-correction)
-    5. Hard rectangular clip — sharp corners, transparent background
-    6. Exact physical resize
-    7. Drop shadow composite
-    8. Save PNG at 300 DPI
+    1. EXIF-aware read           — correct phone photo orientation
+    2. Perspective correction    — four_point_transform using Claude Vision corners
+    3. Rotation correction       — apply rotation_needed from Claude Vision
+    4. Orientation normalisation — landscape for ID, portrait for passport
+    5. Exact physical resize     — consistent size, correct mm at 300 DPI
+    6. Drop shadow on white      — scanned appearance
+    7. Save PNG at 300 DPI
+
+    No background removal: Claude's corners define the card boundary exactly.
+    The four_point_transform output contains only card pixels — no background
+    to remove. The card is placed directly on white with a drop shadow.
     """
     image = read_image_exif_aware(input_path)
 
@@ -360,13 +321,12 @@ def process_image(
         image  = apply_rotation(image, rotation)
         method += f"_rotated_{rotation}"
 
-    # Step 4-5: background removal + hard clip
-    card_rgba = remove_background(image)
+    # Steps 4–5: orientation + exact size
+    card_exact = render_card_exact(
+        image, target_width_mm, target_height_mm, doc_type=doc_type
+    )
 
-    # Step 6: exact physical size + orientation
-    card_exact = render_card_exact(card_rgba, target_width_mm, target_height_mm, doc_type=doc_type)
-
-    # Step 7-8: shadow + save
+    # Steps 6–7: shadow + save
     final_pil = add_drop_shadow(card_exact)
     final_pil.save(output_path, dpi=(DPI, DPI))
 
@@ -591,7 +551,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-08-v9"
+VERSION = "2025-06-08-v10"
 
 @app.get("/version")
 def version():
