@@ -10,9 +10,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
-
-# cache-bust 2025-06-08-v9
-ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py?v=9 /app/main.py
+# cache-bust 2025-06-08-v10
+ADD https://raw.githubusercontent.com/Giuseppe-aif/id-clean-document-api/main/main.py?v=10 /app/main.py
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
