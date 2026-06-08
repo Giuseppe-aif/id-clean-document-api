@@ -32,20 +32,16 @@ DPI = 300
 
 # ── Layout constants (measured from reference PDFs) ───────────────────────────
 
-# ID card render size on page (includes shadow padding)
 ID_RENDER_WIDTH_MM  = 107.0
 ID_RENDER_HEIGHT_MM =  74.0
 
-# ID card positions on A4 page
 ID_FRONT_X_MM =  17.0
 ID_FRONT_Y_MM =  15.0
 ID_BACK_Y_MM  =  93.0
 
-# Passport render size on page
 PASSPORT_RENDER_WIDTH_MM  = 114.0
 PASSPORT_RENDER_HEIGHT_MM = 160.0
 
-# Passport position on A4 page
 PASSPORT_X_MM =  6.0
 PASSPORT_Y_MM = 13.0
 
@@ -90,10 +86,6 @@ def mm_to_pt(mm_value: float) -> float:
 # ── EXIF-aware image read → RGB ndarray ──────────────────────────────────────
 
 def read_image_rgb(path: Path) -> np.ndarray:
-    """
-    Read image honouring EXIF orientation.
-    Returns an RGB uint8 ndarray — colours are correct throughout the pipeline.
-    """
     pil_img = Image.open(path)
     try:
         exif = pil_img._getexif()
@@ -114,19 +106,47 @@ def read_image_rgb(path: Path) -> np.ndarray:
 
 # ── Corner parsing ────────────────────────────────────────────────────────────
 
-def parse_corners(corners_json: Optional[str]) -> Optional[np.ndarray]:
+def parse_corners(
+    corners_json: Optional[str],
+    actual_w: int = 0,
+    actual_h: int = 0,
+) -> Optional[np.ndarray]:
     """
-    Parse corners JSON from Claude Vision (via n8n form field).
+    Parse corners JSON from Claude Vision.
+
+    Claude Vision operates on a downscaled image (~1366px wide regardless of
+    original resolution). If the returned coordinates span less than 70% of
+    the actual image width, we assume they are in scaled space and rescale
+    them to actual pixel coordinates.
+
     Returns float32 (4,2) array [TL, TR, BR, BL] or None.
     """
     if not corners_json:
         return None
     try:
         d = json.loads(corners_json)
-        return np.array([
+        pts = np.array([
             d["top_left"], d["top_right"],
             d["bottom_right"], d["bottom_left"],
         ], dtype="float32")
+
+        # ── Scale correction ──────────────────────────────────────────────────
+        if actual_w > 0 and actual_h > 0:
+            corner_span_x = pts[1][0] - pts[0][0]   # top_right.x - top_left.x
+            corner_span_y = pts[2][1] - pts[0][1]    # bottom_right.y - top_left.y
+
+            # If coords appear to be in a downscaled image space, rescale them.
+            # Threshold: corners span < 70% of actual dimension → scaling needed.
+            if corner_span_x < actual_w * 0.70:
+                scale_x = actual_w / (pts[1][0] + pts[0][0])  # card ≈ edge-to-edge
+                scale_y = actual_h / (pts[2][1] + pts[0][1])
+                # Clamp: scale must be in a plausible range (1.2× – 4×)
+                scale_x = max(1.2, min(scale_x, 4.0))
+                scale_y = max(1.2, min(scale_y, 4.0))
+                pts[:, 0] = np.clip(pts[:, 0] * scale_x, 0, actual_w - 1)
+                pts[:, 1] = np.clip(pts[:, 1] * scale_y, 0, actual_h - 1)
+
+        return pts
     except Exception:
         return None
 
@@ -152,7 +172,6 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 def four_point_transform(image_rgb: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Warp image to flat rectangle. Operates on RGB ndarray, returns RGB ndarray."""
     rect       = order_points(pts)
     tl, tr, br, bl = rect
     max_width  = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
@@ -188,7 +207,6 @@ def force_landscape(image_rgb: np.ndarray) -> np.ndarray:
     return image_rgb
 
 def force_passport_orientation(image_rgb: np.ndarray) -> np.ndarray:
-    """Normalise passport to portrait (taller than wide), text reading L→R."""
     h, w = image_rgb.shape[:2]
     if h > w:
         image_rgb = cv2.rotate(image_rgb, cv2.ROTATE_90_CLOCKWISE)
@@ -202,45 +220,32 @@ def render_card_with_shadow(
     render_w_mm: float,
     render_h_mm: float,
 ) -> Image.Image:
-    """
-    Fit card_rgb inside a canvas of (render_w_mm × render_h_mm) at DPI,
-    preserving aspect ratio, centred, with a Gaussian drop shadow that
-    replicates the Word Centre Shadow Rectangle style.
-    Returns a PIL RGB image ready to save as PNG.
-    """
     shadow_offset_px = mm_to_px(SHADOW_OFFSET_MM)
     shadow_blur_px   = mm_to_px(SHADOW_BLUR_MM)
     shadow_pad       = shadow_blur_px * 2 + shadow_offset_px
 
-    # Available card area (canvas minus shadow padding)
     card_area_w = mm_to_px(render_w_mm) - shadow_pad
     card_area_h = mm_to_px(render_h_mm) - shadow_pad
 
-    # Scale to fit, preserving aspect ratio
     h, w  = card_rgb.shape[:2]
     scale = min(card_area_w / w, card_area_h / h)
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
 
     resized  = cv2.resize(card_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    card_pil = Image.fromarray(resized)   # RGB ndarray → PIL RGB (correct colours)
+    card_pil = Image.fromarray(resized)
 
-    # Canvas dimensions
     canvas_w = card_area_w + shadow_pad
     canvas_h = card_area_h + shadow_pad
 
-    # Card top-left (centred inside card area)
     card_x = (card_area_w - new_w) // 2
     card_y = (card_area_h - new_h) // 2
 
-    # Shadow top-left (offset from card)
     shadow_x = card_x + shadow_offset_px
     shadow_y = card_y + shadow_offset_px
 
-    # White base
     base = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
-    # Shadow layer: solid rect → Gaussian blur
     shadow_layer = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
     shadow_rect  = Image.new(
         "RGBA", (new_w, new_h),
@@ -249,7 +254,6 @@ def render_card_with_shadow(
     shadow_layer.paste(shadow_rect, (shadow_x, shadow_y))
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_px))
 
-    # Composite: base → shadow → card
     base = Image.alpha_composite(base, shadow_layer)
     base.paste(card_pil, (card_x, card_y))
 
@@ -273,18 +277,11 @@ def process_image(
     doc_type: str = "id",
     corners_json: Optional[str] = None,
 ) -> dict:
-    """
-    1. Read image as RGB (EXIF-aware)
-    2. Perspective-correct using Claude Vision corners
-    3. Apply rotation if needed
-    4. Normalise orientation
-    5. Render with drop shadow at target layout size
-    6. Save PNG at 300 DPI
-    """
     img = read_image_rgb(input_path)
+    actual_h, actual_w = img.shape[:2]
 
-    # Perspective correction
-    pts = parse_corners(corners_json)
+    # Perspective correction — pass actual dimensions for coordinate rescaling
+    pts = parse_corners(corners_json, actual_w=actual_w, actual_h=actual_h)
     if pts is not None:
         img    = four_point_transform(img, pts)
         method = "claude_corners_corrected"
@@ -496,7 +493,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-08-v14"
+VERSION = "2025-06-08-v15"
 
 @app.get("/version")
 def version():
