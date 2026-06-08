@@ -226,21 +226,7 @@ def render_card_exact(
 
     target_w_px = mm_to_px(target_width_mm)
     target_h_px = mm_to_px(target_height_mm)
-
-    h, w = card_bgr.shape[:2]
-    scale = min(target_w_px / w, target_h_px / h)
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-
-    resized = cv2.resize(card_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
-    # Place centred on white canvas of exact target size
-    canvas = np.full((target_h_px, target_w_px, 3), 255, dtype=np.uint8)
-    x = (target_w_px - new_w) // 2
-    y = (target_h_px - new_h) // 2
-    canvas[y:y+new_h, x:x+new_w] = resized
-
-    return canvas
+    return cv2.resize(card_bgr, (target_w_px, target_h_px), interpolation=cv2.INTER_LANCZOS4)
 
 
 # ── Drop shadow compositor ────────────────────────────────────────────────────
@@ -560,7 +546,7 @@ async def process_document_test(
     }
 
 
-VERSION = "2025-06-08-v10"
+VERSION = "2025-06-08-v12"
 
 @app.get("/version")
 def version():
